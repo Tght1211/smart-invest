@@ -224,12 +224,76 @@ def cmd_run(args):
         return 3
 
 
+def cmd_stats(args):
+    """Print per-rule win/loss stats for an account."""
+    db = Database()
+    try:
+        row = db.conn.execute(
+            "SELECT id FROM accounts WHERE name = ?", (args.account,)
+        ).fetchone()
+        if not row:
+            print(f"[ERROR] account '{args.account}' not found", file=sys.stderr)
+            return 2
+        engine = DecisionEngine(db, row["id"])
+        stats = engine.compute_rule_stats(
+            start_date=args.start, end_date=args.end,
+        )
+        if args.format == "json":
+            print(json.dumps(stats, ensure_ascii=False, indent=2))
+            return 0
+        # Markdown table
+        if not stats:
+            print(f"# 规则统计 — 账户 {args.account}\n\n（无已平仓交易数据）")
+            return 0
+        print(f"# 规则统计 — 账户 {args.account}")
+        if args.start or args.end:
+            print(f"\n区间: {args.start or '起始'} → {args.end or '至今'}")
+        print()
+        print("| rule_id | 次数 | 胜率 | 均盈 | 均亏 | 期望 |")
+        print("|---------|-----:|------:|------:|------:|------:|")
+        for s in stats:
+            print(
+                f"| `{s['rule_id']}` | {s['count']} | "
+                f"{s['win_rate'] * 100:.0f}% | "
+                f"{s['avg_profit_pct_wins'] * 100:+.2f}% | "
+                f"{s['avg_profit_pct_losses'] * 100:+.2f}% | "
+                f"**{s['expectancy'] * 100:+.2f}%** |"
+            )
+        print()
+        # Suggestions
+        suggestions = []
+        for s in stats:
+            if s["count"] >= 10 and s["expectancy"] < -0.005:
+                suggestions.append(
+                    f"- ⚠️ `{s['rule_id']}` 期望 {s['expectancy'] * 100:+.2f}% "
+                    f"（{s['count']} 次样本），考虑收紧触发条件或降低权重。"
+                )
+            elif s["count"] < 5:
+                suggestions.append(
+                    f"- ℹ️ `{s['rule_id']}` 样本只 {s['count']} 次，"
+                    f"统计不显著，继续观察。"
+                )
+            elif s["expectancy"] >= 0.05:
+                suggestions.append(
+                    f"- ✅ `{s['rule_id']}` 期望 {s['expectancy'] * 100:+.2f}% "
+                    f"（{s['count']} 次样本），表现稳定，可考虑放宽触发条件吸纳更多机会。"
+                )
+        if suggestions:
+            print("## 建议\n")
+            for s in suggestions:
+                print(s)
+        return 0
+    finally:
+        db.close()
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="decide.py",
         description="Smart-Invest decision CLI — single entry for live decisions",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
+
     p = sub.add_parser("run", help="跑决策引擎产出决策包")
     p.add_argument("--account", default="主线", help="账户名称（默认: 主线）")
     p.add_argument(
@@ -241,6 +305,17 @@ def main():
         help="输出格式（默认: json）",
     )
     p.set_defaults(func=cmd_run)
+
+    p_stats = sub.add_parser("stats", help="按规则查询历史胜率/期望")
+    p_stats.add_argument("--account", default="主线", help="账户名称")
+    p_stats.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
+    p_stats.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    p_stats.add_argument(
+        "--format", choices=["json", "md"], default="md",
+        help="输出格式（默认: md）",
+    )
+    p_stats.set_defaults(func=cmd_stats)
+
     args = ap.parse_args()
     sys.exit(args.func(args))
 

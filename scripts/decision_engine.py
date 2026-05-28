@@ -552,6 +552,67 @@ class DecisionEngine:
             "highest_confidence_action": highest,
         }
 
+    # ==================== Phase 2: 规则统计 ====================
+
+    def compute_rule_stats(self, start_date=None, end_date=None):
+        """Aggregate trades by rule_name (which we treat as rule_id).
+
+        Returns list of dicts sorted by expectancy desc:
+          {rule_id, count, wins, losses,
+           win_rate, avg_profit_pct_wins, avg_profit_pct_losses,
+           avg_profit_pct, expectancy}
+
+        Only includes trades with non-null profit_pct (i.e., closed positions).
+        """
+        clauses = [
+            "account_id = ?",
+            "profit_pct IS NOT NULL",
+            "rule_name IS NOT NULL",
+            "rule_name != ''",
+        ]
+        params = [self.account_id]
+        if start_date:
+            clauses.append("date >= ?")
+            params.append(start_date)
+        if end_date:
+            clauses.append("date <= ?")
+            params.append(end_date)
+        where = " AND ".join(clauses)
+
+        rows = self.db.conn.execute(
+            f"SELECT rule_name, profit_pct FROM trades WHERE {where}",
+            params,
+        ).fetchall()
+
+        buckets = {}
+        for r in rows:
+            rid = r["rule_name"]
+            buckets.setdefault(rid, []).append(r["profit_pct"])
+
+        stats = []
+        for rid, profits in buckets.items():
+            wins   = [p for p in profits if p > 0]
+            losses = [p for p in profits if p < 0]
+            n = len(profits)
+            win_rate = len(wins) / n if n else 0.0
+            avg_w  = sum(wins) / len(wins) if wins else 0.0
+            avg_l  = sum(losses) / len(losses) if losses else 0.0
+            avg    = sum(profits) / n if n else 0.0
+            expectancy = win_rate * avg_w + (1 - win_rate) * avg_l
+            stats.append({
+                "rule_id": rid,
+                "count": n,
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": round(win_rate, 4),
+                "avg_profit_pct_wins":   round(avg_w, 4),
+                "avg_profit_pct_losses": round(avg_l, 4),
+                "avg_profit_pct":        round(avg, 4),
+                "expectancy":            round(expectancy, 4),
+            })
+        stats.sort(key=lambda s: s["expectancy"], reverse=True)
+        return stats
+
     # ==================== 旧 helper（保留供回测兼容）====================
 
     def check_buy_preconditions(self, code, name, date, market_data, positions, total_value, cash):
