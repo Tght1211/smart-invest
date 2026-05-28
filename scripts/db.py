@@ -7,13 +7,14 @@ SQLite 数据库管理，支持多账户、决策树版本、进化记录。
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DB_FILE = DATA_DIR / "smart_invest.db"
+DB_FILE = Path(os.environ.get("SMART_INVEST_DB") or (DATA_DIR / "smart_invest.db"))
 
 
 class Database:
