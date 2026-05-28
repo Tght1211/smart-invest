@@ -309,6 +309,77 @@ class DecisionEngine:
         }
         return m.get(info["id"], f"未通过检查：{info['id']}")
 
+    # ---------- stop-loss rules ----------
+
+    def _try_stop_loss(self, code, fund, position, regime):
+        """Highest-priority sell. Returns action dict or None."""
+        nav = fund.get("current_nav", position["cost_nav"])
+        profit_pct = (
+            (nav - position["cost_nav"]) / position["cost_nav"]
+            if position["cost_nav"] else 0.0
+        )
+        day_r = fund.get("day_return", 0.0)
+        three_d = fund.get("fund_3d_return", 0.0)
+        hold_days = position.get("hold_days", 0)
+
+        def _sell(rule_id, label, fraction, reason):
+            return {
+                "code": code,
+                "name": position.get("name") or fund.get("name", ""),
+                "action": "sell",
+                "rule_id": rule_id,
+                "rule_label": label,
+                "confidence": None,  # Task 10
+                "suggested_amount": round(position["shares"] * fraction * nav, 2),
+                "suggested_shares": round(position["shares"] * fraction, 4),
+                "context": {
+                    "profit_pct": profit_pct,
+                    "day_return": day_r,
+                    "hold_days": hold_days,
+                },
+                "checks_passed": [],
+                "checks_failed": [],
+                "reason_zh": reason,
+            }
+
+        # Priority 1: emergency
+        if day_r <= -0.07:
+            return _sell(
+                "emergency_stop_loss", "紧急止损", 0.5,
+                f"单日跌 {abs(day_r) * 100:.1f}% > 7%，立即减仓 50%。",
+            )
+        if three_d <= -0.10:
+            return _sell(
+                "emergency_stop_loss", "紧急止损", 0.5,
+                f"近 3 天累跌 {abs(three_d) * 100:.1f}% > 10%，立即减仓 50%。",
+            )
+        # Priority 2: absolute (hard -20%)
+        if profit_pct <= -0.20:
+            return _sell(
+                "absolute_stop_loss", "绝对止损", 1.0,
+                f"亏损 {abs(profit_pct) * 100:.1f}% > 20%，清仓。",
+            )
+        # Priority 3: time-based
+        if hold_days < 30 and profit_pct <= -0.08:
+            return _sell(
+                "time_based_stop_loss", "短期止损", 0.5,
+                f"持有 {hold_days} 天亏 {abs(profit_pct) * 100:.1f}% > 8%，"
+                f"减仓 50%。",
+            )
+        if 30 <= hold_days <= 90 and profit_pct <= -0.12:
+            return _sell(
+                "time_based_stop_loss", "中期止损", 0.5,
+                f"持有 {hold_days} 天亏 {abs(profit_pct) * 100:.1f}% > 12%，"
+                f"减仓 50%。",
+            )
+        if hold_days > 90 and profit_pct <= -0.15:
+            return _sell(
+                "time_based_stop_loss", "长期止损", 0.5,
+                f"持有 {hold_days} 天亏 {abs(profit_pct) * 100:.1f}% > 15%，"
+                f"减仓 50%。",
+            )
+        return None
+
     # ---------- main evaluator ----------
 
     def _evaluate_rules(self, date, market_data, positions, snapshot,
@@ -316,8 +387,22 @@ class DecisionEngine:
         actions, blocked, alerts = [], [], []
         funds = market_data.get("funds", {})
 
-        # Pass: low_buy on each candidate fund
+        # Pass 1: stop-loss on each existing position (priority over buys)
+        positions_with_sell = set()
+        for pos in positions:
+            code = pos["code"]
+            fund = funds.get(code)
+            if not fund:
+                continue
+            sell = self._try_stop_loss(code, fund, pos, regime)
+            if sell:
+                actions.append(sell)
+                positions_with_sell.add(code)
+
+        # Pass 2: low_buy on each candidate fund (skip if sell already triggered)
         for code, fund in funds.items():
+            if code in positions_with_sell:
+                continue
             action, block = self._try_low_buy(
                 code, fund, snapshot, regime, cash, total_value,
             )

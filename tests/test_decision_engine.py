@@ -100,6 +100,51 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class StopLossTest(DecisionEngineTestBase):
+    def test_emergency_stop_loss_day(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=2.30, sector="科技",
+        )]
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]   = -0.075
+        md["funds"]["512480"]["current_nav"]  = 2.30
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sells = find_action(packet, "512480", "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["rule_id"], "emergency_stop_loss")
+        self.assertAlmostEqual(sells[0]["suggested_shares"], 500.0, places=2)
+
+    def test_absolute_stop_loss(self):
+        # cost 3.0, current 2.30 → -23.3% loss
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=3.00, sector="科技",
+        )]
+        md = make_market_data()
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sells = find_action(packet, "512480", "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["rule_id"], "absolute_stop_loss")
+        self.assertAlmostEqual(sells[0]["suggested_shares"], 1000.0, places=2)
+
+    def test_time_based_stop_loss_short_hold(self):
+        # 10-day hold, cost 2.50, current 2.30 → -8% loss
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=2.50, sector="科技", hold_days=10,
+        )]
+        md = make_market_data()
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sells = find_action(packet, "512480", "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["rule_id"], "time_based_stop_loss")
+        self.assertAlmostEqual(sells[0]["suggested_shares"], 500.0, places=2)
+
+
 class LowBuyTest(DecisionEngineTestBase):
     """低吸规则 + 5 个买入前置检查."""
 
