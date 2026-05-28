@@ -287,6 +287,86 @@ def cmd_stats(args):
         db.close()
 
 
+def cmd_evolve(args):
+    """Read rule_stats from an account, write a strategy_evolutions row with suggestions."""
+    db = Database()
+    try:
+        row = db.conn.execute(
+            "SELECT id, strategy_version FROM accounts WHERE name = ?",
+            (args.account,),
+        ).fetchone()
+        if not row:
+            print(f"[ERROR] account '{args.account}' not found", file=sys.stderr)
+            return 2
+        account_id = row["id"]
+        from_version = row["strategy_version"] or "v2.0"
+        to_version = args.to_version or f"{from_version}+r{int(datetime.now().timestamp())}"
+
+        engine = DecisionEngine(db, account_id)
+        stats = engine.compute_rule_stats()
+        if not stats:
+            print("[INFO] no closed trades found — nothing to evolve from")
+            return 2
+
+        # Build summary metrics
+        before_metrics = {
+            "total_trades": sum(s["count"] for s in stats),
+            "rules": {s["rule_id"]: {
+                "count": s["count"],
+                "win_rate": s["win_rate"],
+                "expectancy": s["expectancy"],
+            } for s in stats},
+        }
+
+        # Generate suggestions
+        suggestions = []
+        for s in stats:
+            if s["count"] >= 10 and s["expectancy"] < -0.005:
+                suggestions.append(
+                    f"`{s['rule_id']}` 期望 {s['expectancy'] * 100:+.2f}% "
+                    f"({s['count']} 样本) → 建议收紧触发阈值或降低仓位倍数"
+                )
+            elif s["count"] >= 10 and s["expectancy"] >= 0.05:
+                suggestions.append(
+                    f"`{s['rule_id']}` 期望 {s['expectancy'] * 100:+.2f}% "
+                    f"({s['count']} 样本) → 表现稳定，可放宽触发条件吸纳更多机会"
+                )
+            elif s["count"] < 5:
+                suggestions.append(
+                    f"`{s['rule_id']}` 仅 {s['count']} 样本 → 继续观察"
+                )
+
+        lessons = "\n".join(f"- {x}" for x in suggestions) or "（无足够样本产生建议）"
+
+        title = args.title or (
+            f"从账户 {args.account} 的回测/历史数据产生的规则评估 ({to_version})"
+        )
+        description = args.description or (
+            f"基于 {before_metrics['total_trades']} 笔已平仓交易，"
+            f"按 rule_id 聚合的胜率与期望分析。"
+        )
+
+        evolution_id = db.add_evolution(
+            from_version=from_version,
+            to_version=to_version,
+            title=title,
+            description=description,
+            trigger_source=f"account:{args.account}",
+            trigger_detail=args.sim_id,
+            before_metrics=before_metrics,
+            after_metrics=None,  # filled when new version is actually deployed
+            lessons_learned=lessons,
+        )
+        print(f"\n[evolution #{evolution_id}] from {from_version} → {to_version}")
+        print(f"  {len(stats)} 条规则统计已保存")
+        print(f"  {len(suggestions)} 条建议:")
+        for s in suggestions:
+            print(f"    - {s}")
+        return 0
+    finally:
+        db.close()
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="decide.py",
@@ -315,6 +395,20 @@ def main():
         help="输出格式（默认: md）",
     )
     p_stats.set_defaults(func=cmd_stats)
+
+    p_evolve = sub.add_parser(
+        "evolve",
+        help="基于规则胜率/期望产生进化建议并写入 strategy_evolutions 表",
+    )
+    p_evolve.add_argument("--account", default="主线", help="账户名称")
+    p_evolve.add_argument("--to-version", default=None, help="新版本号（默认: 自动生成）")
+    p_evolve.add_argument("--title", default=None, help="进化标题")
+    p_evolve.add_argument("--description", default=None, help="详细描述")
+    p_evolve.add_argument(
+        "--sim-id", default=None,
+        help="trigger_detail（若来自某次回测可填 sim_id）",
+    )
+    p_evolve.set_defaults(func=cmd_evolve)
 
     args = ap.parse_args()
     sys.exit(args.func(args))
