@@ -257,6 +257,9 @@ class DecisionEngine:
             "fund_day_return": day_r,
             "hs300_5d_return": regime.get("hs300_5d_return", 0.0),
         }
+        # Phase 3: 把信号附加到 context（观测用，不影响决策）
+        if fund.get("signals"):
+            context["signals"] = fund["signals"]
         if checks_failed:
             primary = checks_failed[0]
             return None, {
@@ -323,6 +326,13 @@ class DecisionEngine:
         hold_days = position.get("hold_days", 0)
 
         def _sell(rule_id, label, fraction, reason):
+            ctx = {
+                "profit_pct": profit_pct,
+                "day_return": day_r,
+                "hold_days": hold_days,
+            }
+            if fund.get("signals"):
+                ctx["signals"] = fund["signals"]
             return {
                 "code": code,
                 "name": position.get("name") or fund.get("name", ""),
@@ -332,11 +342,7 @@ class DecisionEngine:
                 "confidence": None,  # Task 10
                 "suggested_amount": round(position["shares"] * fraction * nav, 2),
                 "suggested_shares": round(position["shares"] * fraction, 4),
-                "context": {
-                    "profit_pct": profit_pct,
-                    "day_return": day_r,
-                    "hold_days": hold_days,
-                },
+                "context": ctx,
                 "checks_passed": [],
                 "checks_failed": [],
                 "reason_zh": reason,
@@ -392,6 +398,9 @@ class DecisionEngine:
             return None
 
         def _sell(rule_id, label, fraction, reason):
+            ctx = {"profit_pct": profit_pct}
+            if fund.get("signals"):
+                ctx["signals"] = fund["signals"]
             return {
                 "code": code,
                 "name": position.get("name") or fund.get("name", ""),
@@ -401,7 +410,7 @@ class DecisionEngine:
                 "confidence": None,
                 "suggested_amount": round(position["shares"] * fraction * nav, 2),
                 "suggested_shares": round(position["shares"] * fraction, 4),
-                "context": {"profit_pct": profit_pct},
+                "context": ctx,
                 "checks_passed": [],
                 "checks_failed": [],
                 "reason_zh": reason,

@@ -378,5 +378,41 @@ class MarketRegimeTest(DecisionEngineTestBase):
         self.assertEqual(r["single_cap"], 0.25)
 
 
+class SignalsAttachmentTest(DecisionEngineTestBase):
+    """Phase 3: fund.signals must be copied through to action.context.signals."""
+
+    def test_signals_attached_to_buy_context(self):
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        md["funds"]["512480"]["signals"] = {
+            "rsi_14": 28.5, "macd_hist": -0.001,
+            "ma20_slope": -0.002, "breakout_20d": False,
+        }
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        buy = find_action(packet, "512480", "buy")[0]
+        self.assertIn("signals", buy["context"])
+        self.assertEqual(buy["context"]["signals"]["rsi_14"], 28.5)
+        self.assertFalse(buy["context"]["signals"]["breakout_20d"])
+
+    def test_signals_attached_to_sell_context(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=2.30, sector="科技",
+        )]
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"] = -0.075
+        md["funds"]["512480"]["signals"] = {
+            "rsi_14": 72.0, "macd_hist": 0.001,
+            "ma20_slope": 0.003, "breakout_20d": True,
+        }
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sell = find_action(packet, "512480", "sell")[0]
+        self.assertIn("signals", sell["context"])
+        self.assertEqual(sell["context"]["signals"]["rsi_14"], 72.0)
+
+
 if __name__ == "__main__":
     unittest.main()

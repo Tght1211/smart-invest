@@ -608,7 +608,11 @@ def _hs300_returns():
 
 
 def _fund_snapshot(code, name, sector):
-    """Fetch latest snapshot for one fund. Returns dict or None if data missing."""
+    """Fetch latest snapshot for one fund. Returns dict or None if data missing.
+
+    Includes Phase 3 technical signals (RSI / MACD / MA20 slope / breakout)
+    computed from the same NAV history we already fetched — no extra network.
+    """
     try:
         gz_url = f"http://fundgz.1234567.com.cn/js/{code}.js"
         gz_text = _get(gz_url)
@@ -624,7 +628,7 @@ def _fund_snapshot(code, name, sector):
 
         nav_url = (
             f"https://api.fund.eastmoney.com/f10/lsjz?"
-            f"fundCode={code}&pageIndex=1&pageSize=25"
+            f"fundCode={code}&pageIndex=1&pageSize=60"   # widened for MACD (needs 35+)
         )
         nav_text = _get(
             nav_url,
@@ -635,18 +639,31 @@ def _fund_snapshot(code, name, sector):
             try:
                 nav_data = json.loads(nav_text)
                 items = nav_data.get("Data", {}).get("LSJZList", [])
-                navs = [float(i["DWJZ"]) for i in items if i.get("DWJZ")]
+                # Items come newest-first; we need oldest→newest for signal funcs
+                navs_newest_first = [float(i["DWJZ"]) for i in items if i.get("DWJZ")]
+                navs = list(reversed(navs_newest_first))
             except Exception:
                 navs = []
 
         if not current_nav and navs:
-            current_nav = navs[0]
+            current_nav = navs[-1]
 
         def _ret(n):
-            return ((current_nav - navs[n]) / navs[n]) if len(navs) > n and navs[n] else 0.0
+            # navs is oldest-first; latest is navs[-1]; n days ago is navs[-(n+1)]
+            if len(navs) > n and navs[-(n + 1)]:
+                return (current_nav - navs[-(n + 1)]) / navs[-(n + 1)]
+            return 0.0
 
         if not current_nav:
             return None  # genuinely missing — engine will emit data_missing alert
+
+        # Phase 3 signals
+        try:
+            from signals import attach_signals
+            sig = attach_signals(navs)
+        except Exception:
+            sig = {"rsi_14": None, "macd_hist": None,
+                   "ma20_slope": None, "breakout_20d": None}
 
         return {
             "name": display_name,
@@ -655,8 +672,9 @@ def _fund_snapshot(code, name, sector):
             "fund_3d_return": _ret(3),
             "fund_5d_return": _ret(5),
             "fund_20d_return": _ret(20),
-            "high_20d": max(navs[:20]) if len(navs) >= 20 else current_nav,
+            "high_20d": max(navs[-20:]) if len(navs) >= 20 else current_nav,
             "sector": sector or _infer_sector(display_name),
+            "signals": sig,
         }
     except Exception:
         return None
