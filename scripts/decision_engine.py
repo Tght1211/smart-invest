@@ -435,6 +435,24 @@ class DecisionEngine:
         actions, blocked, alerts = [], [], []
         funds = market_data.get("funds", {})
 
+        # Account-level drawdown protection
+        peak = market_data.get("portfolio_peak_value")
+        drawdown = (
+            (peak - total_value) / peak
+            if peak and peak > total_value else 0.0
+        )
+        in_drawdown_protection = drawdown >= 0.10
+        if in_drawdown_protection:
+            alerts.append({
+                "severity": "warn",
+                "id": "drawdown_protection",
+                "drawdown": round(drawdown, 4),
+                "reason_zh": (
+                    f"组合从峰值回撤 {drawdown * 100:.1f}% ≥ 10%，"
+                    f"所有买入降级为观察。"
+                ),
+            })
+
         # Pass 1: sells on existing positions (stop-loss > take-profit, sell wins over buy)
         positions_with_sell = set()
         for pos in positions:
@@ -457,7 +475,19 @@ class DecisionEngine:
                 code, fund, snapshot, regime, cash, total_value,
             )
             if action:
-                actions.append(action)
+                if in_drawdown_protection:
+                    actions.append({
+                        **action,
+                        "action": "watch",
+                        "rule_id": "low_buy_deferred_drawdown",
+                        "rule_label": "低吸暂缓（回撤保护）",
+                        "suggested_amount": 0.0,
+                        "reason_zh": (
+                            action["reason_zh"] + " 但组合回撤 ≥ 10%，暂缓买入。"
+                        ),
+                    })
+                else:
+                    actions.append(action)
             if block:
                 blocked.append(block)
 

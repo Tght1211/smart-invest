@@ -100,6 +100,49 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class DrawdownAndBearMarketTest(DecisionEngineTestBase):
+    def test_drawdown_protection_downgrades_buys(self):
+        md = make_market_data()
+        md["portfolio_peak_value"] = 11200.0  # current 10000 → 10.7% drawdown
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        buys = find_action(packet, "512480", "buy")
+        self.assertEqual(buys, [])
+        watches = find_action(packet, "512480", "watch")
+        self.assertEqual(len(watches), 1)
+        self.assertEqual(watches[0]["rule_id"], "low_buy_deferred_drawdown")
+        self.assertTrue(any(
+            a["id"] == "drawdown_protection" for a in packet["alerts"]
+        ))
+
+    def test_bear_market_blocks_new_position(self):
+        md = make_market_data(hs300_20d_return=-0.12)
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        self.assertEqual(find_action(packet, "512480", "buy"), [])
+        self.assertTrue(find_blocked(packet, "512480", "bear_market_new_position"))
+
+    def test_bear_market_allows_low_buy_existing(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=500.0, cost_nav=2.30, sector="科技",
+        )]
+        md = make_market_data(hs300_20d_return=-0.12)
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=6150.0)
+        buys = find_action(packet, "512480", "buy")
+        self.assertEqual(len(buys), 1)
+        # base 3% × 6150 = 184.50, boost 1.0 (fund_5d -6% does not hit -8%; day -3.5% does not hit -5%),
+        # bear-market existing → ×0.5 → 92.25
+        self.assertAlmostEqual(buys[0]["suggested_amount"], 92.25, delta=1.0)
+
+
 class TakeProfitTest(DecisionEngineTestBase):
     def test_take_profit_tier_20(self):
         # cost 1.90, current 2.30 → +21% profit → sell 25%
