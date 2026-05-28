@@ -100,6 +100,81 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class LowBuyTest(DecisionEngineTestBase):
+    """低吸规则 + 5 个买入前置检查."""
+
+    def test_low_buy_triggers(self):
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=[],
+                              cash=2000.0, total_value=10000.0)
+        actions = find_action(packet, "512480", "buy")
+        self.assertEqual(len(actions), 1, packet["actions"])
+        self.assertEqual(actions[0]["rule_id"], "low_buy")
+        self.assertGreater(actions[0]["suggested_amount"], 0)
+
+    def test_low_buy_boosted_amount(self):
+        md = make_market_data(hs300_5d_return=-0.025)
+        md["funds"]["512480"]["day_return"]    = -0.055
+        md["funds"]["512480"]["fund_5d_return"] = -0.09
+        packet = self._decide(md, positions=[],
+                              cash=2000.0, total_value=10000.0)
+        action = find_action(packet, "512480", "buy")[0]
+        # boost = 2x base; base = 3% × 10000 = 300; expected ≈ 600
+        self.assertAlmostEqual(action["suggested_amount"], 600.0, delta=1.0)
+
+    def test_blocked_by_cash_reserve(self):
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        # cash 5% — below 10% min
+        packet = self._decide(md, positions=[],
+                              cash=500.0, total_value=10000.0)
+        self.assertEqual(find_action(packet, "512480", "buy"), [])
+        self.assertTrue(find_blocked(packet, "512480", "cash_reserve"))
+
+    def test_blocked_by_anti_chase(self):
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]     = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = 0.12  # surged 12%
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        self.assertEqual(find_action(packet, "512480", "buy"), [])
+        self.assertTrue(find_blocked(packet, "512480", "anti_chase"))
+
+    def test_blocked_by_sector_concentration(self):
+        # Existing 半导体ETF at 48% of 10000 = 4800. Adding more 科技 would exceed 50%.
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=2086.96, cost_nav=2.34, sector="科技",
+        )]
+        md = make_market_data()
+        # Make 005825 (another 科技 fund) trigger low_buy
+        md["funds"]["005825"] = {
+            "name": "海富通电子传媒股票A", "current_nav": 1.50,
+            "day_return": -0.04, "fund_3d_return": 0.0,
+            "fund_5d_return": -0.06, "fund_20d_return": 0.0,
+            "high_20d": 1.60, "sector": "科技",
+        }
+        packet = self._decide(md, positions=positions,
+                              cash=5200.0, total_value=10000.0)
+        self.assertTrue(find_blocked(packet, "005825", "sector_concentration"))
+
+    def test_blocked_by_single_position_cap(self):
+        # Already 26% of total — over 25% single cap.
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1130.43, cost_nav=2.30, sector="科技",
+        )]
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=positions,
+                              cash=7400.0, total_value=10000.0)
+        self.assertTrue(find_blocked(packet, "512480", "single_position"))
+
+
 class MarketRegimeTest(DecisionEngineTestBase):
     def test_bull_market(self):
         md = make_market_data(hs300_20d_return=0.08)

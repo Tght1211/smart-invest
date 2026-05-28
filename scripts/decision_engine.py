@@ -162,10 +162,171 @@ class DecisionEngine:
             "by_position": by_pos,
         }
 
+    # ---------- precondition checks ----------
+
+    SECTOR_CAP_MAP = {
+        "科技": 0.50, "消费": 0.30, "新能源": 0.30, "金融": 0.20,
+        "资源": 0.20, "宽基": 0.30, "海外": 0.40, "其他": 0.30,
+    }
+
+    def _check_cash_reserve(self, cash_pct):
+        return cash_pct >= 0.10, {
+            "id": "cash_reserve", "actual": cash_pct, "threshold_min": 0.10,
+        }
+
+    def _check_single_position(self, code, snapshot, target_amount, total_value):
+        existing = next(
+            (p for p in snapshot["by_position"] if p["code"] == code), None,
+        )
+        existing_pct = existing["pct_of_total"] if existing else 0.0
+        projected = existing_pct + (
+            target_amount / total_value if total_value else 0.0
+        )
+        return projected <= 0.25, {
+            "id": "single_position",
+            "actual": existing_pct,
+            "projected": projected,
+            "threshold_max": 0.25,
+        }
+
+    def _check_sector_concentration(self, sector, snapshot, target_amount, total_value):
+        if not sector or sector == "其他":
+            return True, {"id": "sector_concentration", "sector": sector, "skipped": True}
+        cap = self.SECTOR_CAP_MAP.get(sector, 0.30)
+        current = snapshot["sectors"].get(sector, 0.0)
+        projected = current + (
+            target_amount / total_value if total_value else 0.0
+        )
+        return projected <= cap, {
+            "id": "sector_concentration",
+            "sector": sector,
+            "actual": current,
+            "projected": projected,
+            "threshold_max": cap,
+        }
+
+    def _check_anti_chase(self, fund):
+        r5 = fund.get("fund_5d_return", 0.0)
+        return r5 <= 0.10, {
+            "id": "anti_chase", "actual": r5, "threshold_max": 0.10,
+        }
+
+    def _check_market_allows_buy(self, regime, has_existing_position):
+        label = regime["label"]
+        if label == "熊市" and not has_existing_position:
+            return False, {"id": "bear_market_new_position", "label": label}
+        if label == "unknown":
+            return False, {"id": "market_regime_unknown", "label": label}
+        return True, {"id": "market_regime", "label": label}
+
+    # ---------- low_buy rule ----------
+
+    def _try_low_buy(self, code, fund, snapshot, regime, cash, total_value):
+        """Return (action_dict, blocked_dict) — exactly one is None, or both None."""
+        day_r = fund.get("day_return", 0.0)
+        if day_r > -0.03:
+            return None, None  # not a low-buy candidate
+
+        base_amount = total_value * 0.03
+        boost = 1.0
+        if day_r <= -0.05 or fund.get("fund_5d_return", 0.0) <= -0.08:
+            boost = 2.0
+        if (regime.get("hs300_5d_return") or 0.0) <= -0.02:
+            boost = 2.0
+        target_amount = base_amount * boost
+
+        existing = next(
+            (p for p in snapshot["by_position"] if p["code"] == code), None,
+        )
+        if regime["label"] == "熊市" and existing:
+            target_amount *= 0.5
+
+        sector = fund.get("sector") or "其他"
+        checks_passed, checks_failed = [], []
+        for ok, info in [
+            self._check_cash_reserve(snapshot["cash_pct"]),
+            self._check_single_position(code, snapshot, target_amount, total_value),
+            self._check_sector_concentration(sector, snapshot, target_amount, total_value),
+            self._check_anti_chase(fund),
+            self._check_market_allows_buy(regime, has_existing_position=existing is not None),
+        ]:
+            (checks_passed if ok else checks_failed).append(info)
+
+        context = {
+            "fund_5d_return": fund.get("fund_5d_return", 0.0),
+            "fund_day_return": day_r,
+            "hs300_5d_return": regime.get("hs300_5d_return", 0.0),
+        }
+        if checks_failed:
+            primary = checks_failed[0]
+            return None, {
+                "code": code,
+                "name": fund.get("name", ""),
+                "attempted_action": "buy",
+                "blocked_by": primary["id"],
+                "reason_zh": self._block_reason_zh(primary, context),
+            }
+
+        return {
+            "code": code,
+            "name": fund.get("name", ""),
+            "action": "buy",
+            "rule_id": "low_buy",
+            "rule_label": "低吸",
+            "confidence": None,  # filled in Task 10
+            "suggested_amount": round(target_amount, 2),
+            "suggested_shares": None,
+            "context": context,
+            "checks_passed": checks_passed,
+            "checks_failed": [],
+            "reason_zh": (
+                f"符合低吸规则：当日跌 {abs(day_r) * 100:.1f}%、"
+                f"近 5 天跌 {abs(fund.get('fund_5d_return', 0.0)) * 100:.1f}%；"
+                f"大盘 {regime['label']}；现金 "
+                f"{snapshot['cash_pct'] * 100:.0f}% 在阈值内。"
+            ),
+        }, None
+
+    def _block_reason_zh(self, info, context):
+        m = {
+            "cash_reserve": (
+                f"现金占比 {info.get('actual', 0) * 100:.1f}% < 10% 最低储备线。"
+            ),
+            "single_position": (
+                f"单只仓位将达 {info.get('projected', 0) * 100:.1f}% > 25% 上限。"
+            ),
+            "sector_concentration": (
+                f"{info.get('sector', '')}赛道将达 "
+                f"{info.get('projected', 0) * 100:.1f}% > "
+                f"{info.get('threshold_max', 0) * 100:.0f}% 上限。"
+            ),
+            "anti_chase": (
+                f"该基金近 5 天涨 {info.get('actual', 0) * 100:.1f}% > 10%，"
+                f"禁止追高。"
+            ),
+            "bear_market_new_position": "大盘处于熊市，禁止新建仓。",
+            "market_regime_unknown": "大盘数据缺失，谨慎起见暂不建仓。",
+        }
+        return m.get(info["id"], f"未通过检查：{info['id']}")
+
+    # ---------- main evaluator ----------
+
     def _evaluate_rules(self, date, market_data, positions, snapshot,
                         regime, cash, total_value):
-        """Filled in Tasks 6-11. Returns (actions, blocked_actions, alerts)."""
-        return [], [], []
+        actions, blocked, alerts = [], [], []
+        funds = market_data.get("funds", {})
+
+        # Pass: low_buy on each candidate fund
+        for code, fund in funds.items():
+            action, block = self._try_low_buy(
+                code, fund, snapshot, regime, cash, total_value,
+            )
+            if action:
+                actions.append(action)
+            if block:
+                blocked.append(block)
+
+        return actions, blocked, alerts
 
     def _build_summary(self, actions):
         counts = {"buy": 0, "sell": 0, "hold": 0, "watch": 0}
