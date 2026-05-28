@@ -1,0 +1,275 @@
+{
+  "version": "v2.0",
+  "parent": "v1.0",
+  "changelog": "加入赛道集中度控制、大盘环境判断、分档止损止盈、低吸策略",
+  "reason": "v1.0缺乏风险控制，容易追高、集中持仓，导致大幅回撤",
+  "created_at": "2026-05-26",
+  "created_by": "ai",
+  "rules": {
+    "buy_preconditions": {
+      "min_cash_ratio": 0.10,
+      "max_single_weight": 0.25,
+      "max_chase_return_5d": 0.10,
+      "max_consecutive_drops": 5,
+      "market_check": {
+        "hs300_5d_drop_limit": -0.05,
+        "hs300_20d_drop_limit": -0.15
+      }
+    },
+    "buy_amount": {
+      "base_ratio": 0.05,
+      "strong_signal_multiplier": 2.0,
+      "weak_signal_multiplier": 0.5,
+      "strong_signals": [
+        "大盘近5天反弹 > 3%",
+        "目标基金近5天跌 > 5%（超跌反弹）",
+        "目标基金突破20日新高"
+      ],
+      "weak_signals": [
+        "大盘震荡（近5天波动 < 2%）",
+        "目标基金已持有（加仓）"
+      ]
+    },
+    "sector_limits": {
+      "科技/AI": 0.50,
+      "消费": 0.30,
+      "新能源": 0.30,
+      "金融": 0.20,
+      "资源": 0.20,
+      "宽基指数": 0.30,
+      "海外": 0.40
+    },
+    "sector_keywords": {
+      "科技/AI": ["半导体", "芯片", "人工智能", "信息科技", "数字经济", "通信", "5G", "AI", "软件", "计算机"],
+      "消费": ["白酒", "食品", "医药", "消费", "医疗", "生物"],
+      "新能源": ["光伏", "锂电", "新能源车", "清洁能源", "风电"],
+      "金融": ["银行", "券商", "保险", "证券"],
+      "资源": ["黄金", "有色金属", "煤炭", "石油", "钢铁"],
+      "宽基指数": ["沪深300", "中证500", "创业板指", "上证50", "中证1000"],
+      "海外": ["纳斯达克", "标普500", "港股", "美国", "全球"]
+    },
+    "market_regimes": {
+      "bull": {
+        "name": "牛市",
+        "condition": "沪深300近20天涨幅 > 5%",
+        "max_position": 0.95,
+        "max_single": 0.30,
+        "chase_limit_5d": 0.15,
+        "stop_loss_adjustment": -0.15
+      },
+      "neutral": {
+        "name": "震荡市",
+        "condition": "沪深300近20天波动 -5% ~ +5%",
+        "max_position": 0.85,
+        "max_single": 0.25,
+        "chase_limit_5d": 0.10,
+        "stop_loss_adjustment": -0.12
+      },
+      "bear": {
+        "name": "熊市",
+        "condition": "沪深300近20天跌幅 > 10%",
+        "max_position": 0.60,
+        "max_single": 0.15,
+        "chase_limit_5d": 0.05,
+        "stop_loss_adjustment": -0.08,
+        "no_new_positions": true,
+        "low_buy_threshold": -0.03
+      }
+    },
+    "stop_loss": [
+      {
+        "name": "紧急止损",
+        "priority": 1,
+        "conditions": {
+          "single_day_drop": -0.07,
+          "three_day_drop": -0.10
+        },
+        "action": "sell_50%",
+        "description": "单日跌幅 > 7% 或 连续3天累计跌幅 > 10%"
+      },
+      {
+        "name": "趋势止损",
+        "priority": 2,
+        "conditions": {
+          "hold_days_min": 30,
+          "consecutive_drops": 5,
+          "below_ma20": true
+        },
+        "action": "sell_30%",
+        "description": "持有 > 30天，近5天连续下跌，且价格 < 20日均线"
+      },
+      {
+        "name": "短期成本止损",
+        "priority": 3,
+        "conditions": {
+          "hold_days_max": 30,
+          "loss_pct": -0.08
+        },
+        "action": "sell_50%",
+        "description": "持有 < 30天，亏损 > 8%"
+      },
+      {
+        "name": "中期成本止损",
+        "priority": 4,
+        "conditions": {
+          "hold_days_min": 30,
+          "hold_days_max": 90,
+          "loss_pct": -0.12
+        },
+        "action": "sell_50%",
+        "description": "持有 30-90天，亏损 > 12%"
+      },
+      {
+        "name": "长期成本止损",
+        "priority": 5,
+        "conditions": {
+          "hold_days_min": 90,
+          "loss_pct": -0.15
+        },
+        "action": "sell_50%",
+        "description": "持有 > 90天，亏损 > 15%"
+      },
+      {
+        "name": "绝对止损",
+        "priority": 0,
+        "conditions": {
+          "loss_pct": -0.20
+        },
+        "action": "sell_100%",
+        "description": "任何情况亏损 > 20% 清仓"
+      }
+    ],
+    "take_profit": [
+      {
+        "level": 0.20,
+        "action": "sell_25%",
+        "cumulative": 0.25,
+        "description": "盈利 +20% 卖出 25%"
+      },
+      {
+        "level": 0.30,
+        "action": "sell_25%",
+        "cumulative": 0.50,
+        "description": "盈利 +30% 再卖出 25%（累计50%）"
+      },
+      {
+        "level": 0.40,
+        "action": "sell_25%",
+        "cumulative": 0.75,
+        "description": "盈利 +40% 再卖出 25%（累计75%）"
+      },
+      {
+        "level": 0.50,
+        "action": "sell_100%",
+        "cumulative": 1.00,
+        "description": "盈利 +50% 清仓"
+      }
+    ],
+    "drawdown_take_profit": {
+      "description": "从最高点回撤止盈",
+      "drawdown_10pct": "卖出 50%",
+      "drawdown_15pct": "清仓",
+      "track_highest": true
+    },
+    "rebalance": {
+      "check_interval_days": 5,
+      "single_deviation": {
+        "over": 1.5,
+        "under": 0.5
+      },
+      "sector_deviation": {
+        "over": 1.3
+      },
+      "cash_range": {
+        "min": 0.10,
+        "max": 0.30
+      }
+    },
+    "low_buy": {
+      "description": "低吸策略",
+      "conditions": {
+        "market_not_bear": true,
+        "target_5d_return_max": 0.05,
+        "target_day_drop_min": -0.03,
+        "cash_ratio_min": 0.15,
+        "single_weight_max": 0.20
+      },
+      "amount": {
+        "base_ratio": 0.03,
+        "boost_multiplier": 2.0,
+        "boost_conditions": [
+          "当日跌幅 > 5%",
+          "近5天跌幅 > 8%",
+          "大盘当日跌幅 > 2%"
+        ]
+      }
+    },
+    "position_building": {
+      "description": "建仓策略",
+      "initial_budget_allocation": [
+        {
+          "batch": 1,
+          "ratio": 0.40,
+          "fund_count": "3-4",
+          "per_fund": 0.10,
+          "cash_reserve": 0.40
+        },
+        {
+          "batch": 2,
+          "ratio": 0.30,
+          "timing": "观察1周后",
+          "action": "加仓表现好的基金或新建仓",
+          "cash_reserve": 0.10
+        },
+        {
+          "batch": 3,
+          "ratio": 0.30,
+          "action": "等待回调机会，对核心持仓加仓",
+          "cash_reserve": "0.10-0.20"
+        }
+      ],
+      "fund_selection": {
+        "must_meet": [
+          "近1年收益 > 沪深300同期",
+          "近1年最大回撤 < 25%",
+          "基金规模 > 2亿",
+          "基金经理任职 > 2年",
+          "与已持有基金赛道不同"
+        ],
+        "prefer": [
+          "近6月排名前1/4",
+          "夏普比率 > 1",
+          "波动率 < 同类平均",
+          "机构持有比例 > 30%"
+        ]
+      }
+    },
+    "risk_red_lines": {
+      "absolute_prohibitions": [
+        "单只基金仓位 > 30%",
+        "单赛道仓位 > 50%",
+        "现金比例 < 5%",
+        "亏损 > 20% 不止损",
+        "追涨近5天涨幅 > 15% 的基金",
+        "熊市中新建仓",
+        "单日交易 > 3次"
+      ],
+      "warning_signals": [
+        "单只基金亏损 > 10%",
+        "组合回撤 > 8%",
+        "连续5天亏损",
+        "单赛道亏损 > 15%"
+      ]
+    },
+    "decision_priority": [
+      "风控红线（绝对禁止）",
+      "紧急止损",
+      "大盘环境判断",
+      "止损规则",
+      "止盈规则",
+      "再平衡规则",
+      "低吸规则",
+      "建仓规则"
+    ]
+  }
+}

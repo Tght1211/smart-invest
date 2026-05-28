@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+决策引擎 — Smart Invest Skill
+执行决策树规则，记录审计日志，支持策略进化分析。
+纯 Python 3 标准库。
+"""
+
+import json
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from db import Database
+
+
+class DecisionEngine:
+    """决策引擎：执行规则 + 记录审计日志"""
+
+    def __init__(self, db, account_id, strategy_version=None):
+        self.db = db
+        self.account_id = account_id
+        self.strategy_version = strategy_version or "v2.0"
+        self.rules = self._load_rules()
+
+    def _load_rules(self):
+        """加载决策树规则"""
+        tree = self.db.get_tree_version(self.strategy_version)
+        if tree and "rules" in tree:
+            return tree["rules"]
+
+        # 如果 DB 中没有，从 JSON 文件加载
+        json_file = DATA_DIR / "decision_tree.json"
+        if json_file.exists():
+            with open(json_file, "r", encoding="utf-8") as f:
+                tree = json.load(f)
+                return tree.get("rules", {})
+
+        return {}
+
+    def get_fund_sector(self, code, name):
+        """判断基金所属赛道"""
+        keywords = self.rules.get("sector_keywords", {})
+        for sector, kws in keywords.items():
+            for kw in kws:
+                if kw in name or kw in code:
+                    return sector
+        return "其他"
+
+    def check_buy_preconditions(self, code, name, date, market_data, positions, total_value, cash):
+        """
+        检查买入前置条件
+        返回: (allowed, passed_checks, failed_checks)
+        """
+        preconds = self.rules.get("buy_preconditions", {})
+        passed = []
+        failed = []
+
+        # 1. 现金储备检查
+        cash_ratio = cash / total_value if total_value > 0 else 0
+        min_cash = preconds.get("min_cash_ratio", 0.10)
+        if cash_ratio < min_cash:
+            failed.append(f"现金比例 {cash_ratio:.1%} < {min_cash:.0%}")
+        else:
+            passed.append(f"现金比例 {cash_ratio:.1%} >= {min_cash:.0%}")
+
+        # 2. 单只基金仓位检查
+        max_single = preconds.get("max_single_weight", 0.25)
+        current_value = sum(p["shares"] * p["cost_nav"] for p in positions if p["code"] == code)
+        current_weight = current_value / total_value if total_value > 0 else 0
+        if current_weight > max_single:
+            failed.append(f"单只仓位 {current_weight:.1%} > {max_single:.0%}")
+        else:
+            passed.append(f"单只仓位 {current_weight:.1%} <= {max_single:.0%}")
+
+        # 3. 赛道集中度检查
+        sector = self.get_fund_sector(code, name)
+        sector_limits = self.rules.get("sector_limits", {})
+        sector_limit = sector_limits.get(sector, 0.50)
+        sector_value = sum(
+            p["shares"] * p["cost_nav"]
+            for p in positions
+            if self.get_fund_sector(p["code"], p["name"]) == sector
+        )
+        sector_weight = sector_value / total_value if total_value > 0 else 0
+        if sector_weight > sector_limit:
+            failed.append(f"{sector}赛道 {sector_weight:.1%} > {sector_limit:.0%}")
+        else:
+            passed.append(f"{sector}赛道 {sector_weight:.1%} <= {sector_limit:.0%}")
+
+        # 4. 追高检查
+        max_chase = preconds.get("max_chase_return_5d", 0.10)
+        fund_5d_return = market_data.get("fund_5d_return", 0)
+        if fund_5d_return > max_chase:
+            failed.append(f"近5天涨幅 {fund_5d_return:.1%} > {max_chase:.0%}（追高）")
+        else:
+            passed.append(f"近5天涨幅 {fund_5d_return:.1%} <= {max_chase:.0%}")
+
+        # 5. 大盘环境检查
+        market_check = preconds.get("market_check", {})
+        hs300_5d = market_data.get("hs300_5d_return", 0)
+        hs300_20d = market_data.get("hs300_20d_return", 0)
+
+        if hs300_5d < market_check.get("hs300_5d_drop_limit", -0.05):
+            failed.append(f"沪深300近5天跌 {hs300_5d:.1%}，仅允许加仓已持仓")
+        elif hs300_20d < market_check.get("hs300_20d_drop_limit", -0.15):
+            failed.append(f"沪深300近20天跌 {hs300_20d:.1%}，熊市禁止买入")
+        else:
+            passed.append(f"大盘环境正常（5天 {hs300_5d:.1%}，20天 {hs300_20d:.1%}）")
+
+        # 6. 趋势检查
+        max_drops = preconds.get("max_consecutive_drops", 5)
+        consecutive_drops = market_data.get("fund_consecutive_drops", 0)
+        if consecutive_drops >= max_drops:
+            failed.append(f"连续下跌 {consecutive_drops} 天，暂缓")
+        else:
+            passed.append(f"趋势正常（连续下跌 {consecutive_drops} 天）")
+
+        allowed = len(failed) == 0
+        return allowed, passed, failed
+
+    def check_stop_loss(self, code, date, position, market_data):
+        """
+        检查止损规则
+        返回: (triggered, rule_name, sell_ratio, reason)
+        """
+        stop_loss_rules = self.rules.get("stop_loss", [])
+        # 按优先级排序
+        stop_loss_rules = sorted(stop_loss_rules, key=lambda x: x.get("priority", 99))
+
+        cost_nav = position["cost_nav"]
+        current_nav = market_data.get("current_nav", cost_nav)
+        loss_pct = (current_nav - cost_nav) / cost_nav if cost_nav > 0 else 0
+
+        # 买入日期
+        buy_date_str = position.get("buy_date")
+        if buy_date_str:
+            buy_date = datetime.fromisoformat(buy_date_str[:10])
+            hold_days = (datetime.fromisoformat(date) - buy_date).days
+        else:
+            hold_days = 0
+
+        for rule in stop_loss_rules:
+            conditions = rule.get("conditions", {})
+            triggered = False
+
+            # 绝对止损
+            if "loss_pct" in conditions and conditions["loss_pct"] == -0.20:
+                if loss_pct <= -0.20:
+                    triggered = True
+
+            # 紧急止损
+            elif "single_day_drop" in conditions:
+                day_drop = market_data.get("fund_day_return", 0)
+                three_day_drop = market_data.get("fund_3d_return", 0)
+                if day_drop <= conditions["single_day_drop"] or three_day_drop <= conditions.get("three_day_drop", -0.10):
+                    triggered = True
+
+            # 趋势止损
+            elif "consecutive_drops" in conditions and "below_ma20" in conditions:
+                if (hold_days >= conditions.get("hold_days_min", 30) and
+                    market_data.get("fund_consecutive_drops", 0) >= conditions["consecutive_drops"] and
+                    market_data.get("below_ma20", False)):
+                    triggered = True
+
+            # 短期成本止损
+            elif "hold_days_max" in conditions and conditions.get("hold_days_max") == 30:
+                if hold_days < 30 and loss_pct <= conditions["loss_pct"]:
+                    triggered = True
+
+            # 中期成本止损
+            elif "hold_days_min" in conditions and conditions.get("hold_days_min") == 30:
+                if 30 <= hold_days < 90 and loss_pct <= conditions["loss_pct"]:
+                    triggered = True
+
+            # 长期成本止损
+            elif "hold_days_min" in conditions and conditions.get("hold_days_min") == 90:
+                if hold_days >= 90 and loss_pct <= conditions["loss_pct"]:
+                    triggered = True
+
+            if triggered:
+                action = rule["action"]
+                sell_ratio = {
+                    "sell_30%": 0.30,
+                    "sell_50%": 0.50,
+                    "sell_100%": 1.00
+                }.get(action, 0.50)
+                return True, rule["name"], sell_ratio, rule["description"]
+
+        return False, None, 0, None
+
+    def check_take_profit(self, code, date, position, market_data):
+        """
+        检查止盈规则
+        返回: (triggered, rule_name, sell_ratio, reason)
+        """
+        take_profit_rules = self.rules.get("take_profit", [])
+        cost_nav = position["cost_nav"]
+        current_nav = market_data.get("current_nav", cost_nav)
+        profit_pct = (current_nav - cost_nav) / cost_nav if cost_nav > 0 else 0
+
+        for rule in take_profit_rules:
+            if profit_pct >= rule["level"]:
+                action = rule["action"]
+                sell_ratio = {
+                    "sell_25%": 0.25,
+                    "sell_50%": 0.50,
+                    "sell_100%": 1.00
+                }.get(action, 0.25)
+                return True, f"止盈{rule['level']:.0%}", sell_ratio, rule["description"]
+
+        # 回撤止盈
+        drawdown_rules = self.rules.get("drawdown_take_profit", {})
+        if drawdown_rules.get("track_highest"):
+            highest_nav = market_data.get("highest_nav", current_nav)
+            if highest_nav > cost_nav:
+                drawdown_from_high = (highest_nav - current_nav) / highest_nav
+                if drawdown_from_high >= 0.15:
+                    return True, "回撤止盈15%", 1.00, "从最高点回撤 > 15% 清仓"
+                elif drawdown_from_high >= 0.10:
+                    return True, "回撤止盈10%", 0.50, "从最高点回撤 > 10% 卖出50%"
+
+        return False, None, 0, None
+
+    def check_low_buy(self, code, name, date, market_data, positions, total_value, cash):
+        """
+        检查低吸条件
+        返回: (allowed, reason)
+        """
+        low_buy = self.rules.get("low_buy", {})
+        conditions = low_buy.get("conditions", {})
+
+        # 检查所有条件
+        if market_data.get("market_regime") == "熊市":
+            return False, "熊市环境"
+
+        if market_data.get("fund_5d_return", 0) > conditions.get("target_5d_return_max", 0.05):
+            return False, "近5天涨幅过高"
+
+        if market_data.get("fund_day_return", 0) > conditions.get("target_day_drop_min", -0.03):
+            return False, "当日跌幅不够"
+
+        if cash / total_value < conditions.get("cash_ratio_min", 0.15):
+            return False, "现金不足"
+
+        # 检查单只仓位
+        current_value = sum(p["shares"] * p["cost_nav"] for p in positions if p["code"] == code)
+        if current_value / total_value > conditions.get("single_weight_max", 0.20):
+            return False, "仓位已满"
+
+        return True, "符合低吸条件"
+
+    def calculate_buy_amount(self, code, date, market_data, positions, total_value, cash):
+        """计算买入金额"""
+        buy_amount_rules = self.rules.get("buy_amount", {})
+        base_ratio = buy_amount_rules.get("base_ratio", 0.05)
+        base_amount = total_value * base_ratio
+
+        # 判断信号强度
+        strong_signals = 0
+        weak_signals = 0
+
+        # 大盘近5天反弹 > 3%
+        if market_data.get("hs300_5d_return", 0) > 0.03:
+            strong_signals += 1
+
+        # 目标基金近5天跌 > 5%
+        if market_data.get("fund_5d_return", 0) < -0.05:
+            strong_signals += 1
+
+        # 大盘震荡
+        if abs(market_data.get("hs300_5d_return", 0)) < 0.02:
+            weak_signals += 1
+
+        # 已持有（加仓）
+        if any(p["code"] == code for p in positions):
+            weak_signals += 1
+
+        # 调整倍数
+        if strong_signals > 0:
+            multiplier = buy_amount_rules.get("strong_signal_multiplier", 2.0)
+        elif weak_signals > 0:
+            multiplier = buy_amount_rules.get("weak_signal_multiplier", 0.5)
+        else:
+            multiplier = 1.0
+
+        amount = base_amount * multiplier
+        # 不超过现金的 80%
+        amount = min(amount, cash * 0.8)
+        return amount
+
+    def log_decision(self, date, code, name, action, rule_name, decision_context,
+                     reason, checks_passed, checks_failed, trade_id=None):
+        """记录决策审计日志"""
+        # 更新交易记录的审计字段
+        if trade_id:
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                UPDATE trades SET
+                    rule_name = ?,
+                    rule_version = ?,
+                    decision_context = ?,
+                    reason = ?,
+                    checks_passed = ?,
+                    checks_failed = ?
+                WHERE id = ?
+            """, (
+                rule_name,
+                self.strategy_version,
+                json.dumps(decision_context, ensure_ascii=False),
+                reason,
+                json.dumps(checks_passed, ensure_ascii=False) if checks_passed else None,
+                json.dumps(checks_failed, ensure_ascii=False) if checks_failed else None,
+                trade_id
+            ))
+            self.db.conn.commit()
+
+    def analyze_performance(self, start_date=None, end_date=None):
+        """分析账户表现"""
+        trades = self.db.get_trades(self.account_id)
+
+        # 筛选日期范围
+        if start_date:
+            trades = [t for t in trades if t["date"] >= start_date]
+        if end_date:
+            trades = [t for t in trades if t["date"] <= end_date]
+
+        # 统计
+        total_trades = len(trades)
+        wins = sum(1 for t in trades if t.get("outcome") == "win")
+        losses = sum(1 for t in trades if t.get("outcome") == "loss")
+        pending = sum(1 for t in trades if t.get("outcome") == "pending" or not t.get("outcome"))
+
+        # 按规则统计
+        rule_stats = {}
+        for t in trades:
+            rule = t.get("rule_name") or "未分类"
+            if rule not in rule_stats:
+                rule_stats[rule] = {"total": 0, "wins": 0, "losses": 0}
+            rule_stats[rule]["total"] += 1
+            if t.get("outcome") == "win":
+                rule_stats[rule]["wins"] += 1
+            elif t.get("outcome") == "loss":
+                rule_stats[rule]["losses"] += 1
+
+        return {
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "pending": pending,
+            "win_rate": wins / total_trades if total_trades > 0 else 0,
+            "rule_stats": rule_stats
+        }
+
+    def suggest_evolution(self, performance_report):
+        """基于表现建议进化方向"""
+        suggestions = []
+
+        # 分析各规则表现
+        for rule, stats in performance_report.get("rule_stats", {}).items():
+            if stats["total"] >= 5:  # 至少5笔交易
+                win_rate = stats["wins"] / stats["total"]
+                if win_rate < 0.4:
+                    suggestions.append({
+                        "rule": rule,
+                        "issue": f"胜率过低 {win_rate:.1%}",
+                        "suggestion": f"考虑收紧 {rule} 的条件"
+                    })
+                elif win_rate > 0.7:
+                    suggestions.append({
+                        "rule": rule,
+                        "issue": f"胜率很高 {win_rate:.1%}",
+                        "suggestion": f"可以考虑放宽 {rule} 的条件"
+                    })
+
+        return suggestions
+
+
+def main():
+    """CLI 测试"""
+    import argparse
+    parser = argparse.ArgumentParser(description="决策引擎 — Smart Invest Skill")
+    sub = parser.add_subparsers(dest="command")
+
+    p_analyze = sub.add_parser("analyze", help="分析账户表现")
+    p_analyze.add_argument("--account", "-a", required=True, help="账户名称")
+    p_analyze.add_argument("--start", help="开始日期")
+    p_analyze.add_argument("--end", help="结束日期")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    if args.command == "analyze":
+        db = Database()
+        account = db.get_account(name=args.account)
+        if not account:
+            print(f"[ERROR] 账户不存在: {args.account}")
+            return
+
+        engine = DecisionEngine(db, account["id"], account.get("strategy_version"))
+        report = engine.analyze_performance(args.start, args.end)
+
+        print(f"\n账户: {args.account} 表现分析")
+        print(f"{'='*60}")
+        print(f"总交易: {report['total_trades']}")
+        print(f"盈利: {report['wins']}")
+        print(f"亏损: {report['losses']}")
+        print(f"胜率: {report['win_rate']:.1%}")
+        print(f"\n各规则表现:")
+        for rule, stats in report["rule_stats"].items():
+            win_rate = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
+            print(f"  {rule}: {stats['total']}笔, 胜率 {win_rate:.1%}")
+        print(f"{'='*60}\n")
+
+        suggestions = engine.suggest_evolution(report)
+        if suggestions:
+            print("进化建议:")
+            for s in suggestions:
+                print(f"  - {s['rule']}: {s['suggestion']}")
+
+        db.close()
+
+
+if __name__ == "__main__":
+    main()

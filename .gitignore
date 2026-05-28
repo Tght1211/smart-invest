@@ -1,0 +1,18 @@
+# Private data
+data/email_config.json
+data/smart_invest.db
+data/portfolio.json
+data/orders.json
+data/snapshot.json
+data/config.json
+data/simulations/
+
+# Python
+__pycache__/
+*.pyc
+
+# Reports (generated)
+reports/*.md
+
+# OS
+.DS_Store
