@@ -380,6 +380,54 @@ class DecisionEngine:
             )
         return None
 
+    # ---------- take-profit tiers ----------
+
+    def _try_take_profit(self, code, fund, position):
+        nav = fund.get("current_nav", position["cost_nav"])
+        profit_pct = (
+            (nav - position["cost_nav"]) / position["cost_nav"]
+            if position["cost_nav"] else 0.0
+        )
+        if profit_pct < 0.20:
+            return None
+
+        def _sell(rule_id, label, fraction, reason):
+            return {
+                "code": code,
+                "name": position.get("name") or fund.get("name", ""),
+                "action": "sell",
+                "rule_id": rule_id,
+                "rule_label": label,
+                "confidence": None,
+                "suggested_amount": round(position["shares"] * fraction * nav, 2),
+                "suggested_shares": round(position["shares"] * fraction, 4),
+                "context": {"profit_pct": profit_pct},
+                "checks_passed": [],
+                "checks_failed": [],
+                "reason_zh": reason,
+            }
+
+        # Highest tier first
+        if profit_pct >= 0.50:
+            return _sell(
+                "take_profit_clearout", "止盈清仓", 1.0,
+                f"盈利 {profit_pct * 100:.1f}% ≥ 50%，清仓锁利。",
+            )
+        if profit_pct >= 0.40:
+            return _sell(
+                "take_profit_tier_40", "止盈第三档", 0.25,
+                f"盈利 {profit_pct * 100:.1f}% ≥ 40%，再减 25%。",
+            )
+        if profit_pct >= 0.30:
+            return _sell(
+                "take_profit_tier_30", "止盈第二档", 0.25,
+                f"盈利 {profit_pct * 100:.1f}% ≥ 30%，再减 25%。",
+            )
+        return _sell(
+            "take_profit_tier_20", "止盈首档", 0.25,
+            f"盈利 {profit_pct * 100:.1f}% ≥ 20%，减仓 25%。",
+        )
+
     # ---------- main evaluator ----------
 
     def _evaluate_rules(self, date, market_data, positions, snapshot,
@@ -387,7 +435,7 @@ class DecisionEngine:
         actions, blocked, alerts = [], [], []
         funds = market_data.get("funds", {})
 
-        # Pass 1: stop-loss on each existing position (priority over buys)
+        # Pass 1: sells on existing positions (stop-loss > take-profit, sell wins over buy)
         positions_with_sell = set()
         for pos in positions:
             code = pos["code"]
@@ -395,6 +443,8 @@ class DecisionEngine:
             if not fund:
                 continue
             sell = self._try_stop_loss(code, fund, pos, regime)
+            if not sell:
+                sell = self._try_take_profit(code, fund, pos)
             if sell:
                 actions.append(sell)
                 positions_with_sell.add(code)

@@ -100,6 +100,34 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class TakeProfitTest(DecisionEngineTestBase):
+    def test_take_profit_tier_20(self):
+        # cost 1.90, current 2.30 → +21% profit → sell 25%
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=1.90, sector="科技",
+        )]
+        packet = self._decide(make_market_data(), positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sells = find_action(packet, "512480", "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["rule_id"], "take_profit_tier_20")
+        self.assertAlmostEqual(sells[0]["suggested_shares"], 250.0, places=2)
+
+    def test_take_profit_clearout(self):
+        # cost 1.50, current 2.30 → +53% profit → full clear
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=1.50, sector="科技",
+        )]
+        packet = self._decide(make_market_data(), positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sells = find_action(packet, "512480", "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["rule_id"], "take_profit_clearout")
+        self.assertAlmostEqual(sells[0]["suggested_shares"], 1000.0, places=2)
+
+
 class StopLossTest(DecisionEngineTestBase):
     def test_emergency_stop_loss_day(self):
         positions = [make_position(
