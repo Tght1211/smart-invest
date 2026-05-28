@@ -270,6 +270,25 @@
       "再平衡规则",
       "低吸规则",
       "建仓规则"
-    ]
+    ],
+    "rules_meta": {
+      "cash_reserve":              {"severity": "block", "enabled": true, "zh": "现金储备 ≥ 10%"},
+      "single_position":           {"severity": "block", "enabled": true, "zh": "单只仓位 ≤ 25%"},
+      "sector_concentration":      {"severity": "block", "enabled": true, "zh": "赛道集中度上限"},
+      "anti_chase":                {"severity": "block", "enabled": true, "zh": "禁止追涨 5 日 > 10%"},
+      "bear_market_new_position":  {"severity": "block", "enabled": true, "zh": "熊市禁止新建仓"},
+      "market_regime_unknown":     {"severity": "block", "enabled": true, "zh": "大盘数据缺失暂停建仓"},
+      "low_buy":                   {"severity": "info",  "enabled": true, "zh": "当日跌 > 3% 低吸"},
+      "emergency_stop_loss":       {"severity": "warn",  "enabled": true, "zh": "单日 > 7% 或 3 日 > 10% 紧急止损"},
+      "absolute_stop_loss":        {"severity": "warn",  "enabled": true, "zh": "亏损 > 20% 强制清仓"},
+      "time_based_stop_loss":      {"severity": "warn",  "enabled": true, "zh": "按持有期分档止损"},
+      "take_profit_tier_20":       {"severity": "info",  "enabled": true, "zh": "+20% 减仓 25%"},
+      "take_profit_tier_30":       {"severity": "info",  "enabled": true, "zh": "+30% 再减 25%"},
+      "take_profit_tier_40":       {"severity": "info",  "enabled": true, "zh": "+40% 再减 25%"},
+      "take_profit_clearout":      {"severity": "info",  "enabled": true, "zh": "+50% 清仓锁利"},
+      "drawdown_protection":       {"severity": "warn",  "enabled": true, "zh": "组合回撤 ≥ 10% 暂缓买入"},
+      "low_buy_deferred_drawdown": {"severity": "info",  "enabled": true, "zh": "回撤保护下低吸降级为观察"},
+      "data_missing":              {"severity": "warn",  "enabled": true, "zh": "无法获取基金数据，跳过决策"}
+    }
   }
 }
