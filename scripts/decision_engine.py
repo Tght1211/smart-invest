@@ -485,6 +485,15 @@ class DecisionEngine:
             code = pos["code"]
             fund = funds.get(code)
             if not fund:
+                alerts.append({
+                    "severity": "warn",
+                    "id": "data_missing",
+                    "code": code,
+                    "reason_zh": (
+                        f"无法获取基金 {code}（{pos.get('name', '')}）的"
+                        f"实时数据，已跳过决策。"
+                    ),
+                })
                 continue
             sell = self._try_stop_loss(code, fund, pos, regime)
             if not sell:

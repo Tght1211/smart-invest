@@ -100,6 +100,33 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class DataMissingTest(DecisionEngineTestBase):
+    def test_missing_fund_data_emits_alert(self):
+        positions = [make_position(
+            "999999", "无数据基金",
+            shares=100.0, cost_nav=1.00, sector="其他",
+        )]
+        md = make_market_data()
+        # 999999 deliberately not in md["funds"]
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=5100.0)
+        self.assertEqual(find_action(packet, "999999", "sell"), [])
+        self.assertEqual(find_action(packet, "999999", "buy"), [])
+        self.assertTrue(any(
+            a["id"] == "data_missing" and a.get("code") == "999999"
+            for a in packet["alerts"]
+        ))
+
+    def test_unknown_regime_blocks_new_buys(self):
+        md = make_market_data(hs300_20d_return=None)
+        md["funds"]["512480"]["day_return"]    = -0.035
+        md["funds"]["512480"]["fund_5d_return"] = -0.06
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        self.assertEqual(find_action(packet, "512480", "buy"), [])
+        self.assertTrue(find_blocked(packet, "512480", "market_regime_unknown"))
+
+
 class ConfidenceTest(DecisionEngineTestBase):
     def test_confidence_for_low_buy(self):
         md = make_market_data()
