@@ -59,6 +59,17 @@ SECTOR_KEYWORDS = {
     "海外": ["纳斯达克", "标普", "美股", "港股", "恒生", "QDII", "全球"],
 }
 
+def _infer_sector_local(name):
+    """Local copy of sector inference (used by engine_mode market_data builder)."""
+    if not name:
+        return "其他"
+    for sector, kws in SECTOR_KEYWORDS.items():
+        for kw in kws:
+            if kw in name:
+                return sector
+    return "其他"
+
+
 # 赛道仓位上限
 SECTOR_LIMITS = {
     "科技": 0.50,
@@ -159,7 +170,7 @@ class Simulator:
     """历史回测模拟器"""
 
     def __init__(self, start_date, end_date, budget, funds=None, sim_id=None, verbose=True,
-                 db=None, strategy_version="v2.0"):
+                 db=None, strategy_version="v2.0", engine_mode=False):
         self.start_date = start_date
         self.end_date = end_date
         self.budget = budget
@@ -175,6 +186,9 @@ class Simulator:
         self.sim_dir = SIM_DIR / self.sim_id
         self.diary_lines = []  # 日记内容
         self.verbose = verbose    # 是否在终端打印每日完整报告
+
+        # Phase 2: --engine 让回测调 DecisionEngine.decide() 而不是内置规则
+        self.engine_mode = engine_mode
 
         # 数据库集成
         self.db = db
@@ -492,18 +506,150 @@ class Simulator:
 
         return True
 
+    # ==================== Phase 2: 引擎驱动回测 ====================
+
+    def _build_market_data_for_engine(self, date, trading_days):
+        """构造 DecisionEngine.decide() 期望的 market_data 字典。
+
+        关键约束（无未来函数）：只使用 date 当天及之前的 NAV 数据。
+        """
+        # HS300 5d / 20d 回报（用 1.000300 指数数据，已 load_data 拉到）
+        hs300_data = self.index_data.get("1.000300", {}) or {}
+        hs300_dates = sorted(d for d in hs300_data.keys() if d <= date)
+        if len(hs300_dates) >= 21:
+            latest = hs300_data[hs300_dates[-1]]
+            d5 = hs300_data[hs300_dates[-6]]
+            d20 = hs300_data[hs300_dates[-21]]
+            hs300_5d = (latest - d5) / d5 if d5 else 0.0
+            hs300_20d = (latest - d20) / d20 if d20 else 0.0
+        else:
+            hs300_5d, hs300_20d = None, None
+
+        funds = {}
+        idx_today = trading_days.index(date) if date in trading_days else -1
+        for code, name in self.fund_names.items():
+            current_nav = self.get_nav(code, date)
+            if current_nav is None:
+                continue
+            # 各历史回报
+            def _nav_n_days_ago(n):
+                if idx_today >= n:
+                    return self.get_nav(code, trading_days[idx_today - n])
+                return None
+
+            prev_nav = _nav_n_days_ago(1)
+            nav3 = _nav_n_days_ago(3)
+            nav5 = _nav_n_days_ago(5)
+            nav20 = _nav_n_days_ago(20)
+
+            day_return = ((current_nav - prev_nav) / prev_nav) if prev_nav else 0.0
+            fund_3d   = ((current_nav - nav3)  / nav3)  if nav3  else 0.0
+            fund_5d   = ((current_nav - nav5)  / nav5)  if nav5  else 0.0
+            fund_20d  = ((current_nav - nav20) / nav20) if nav20 else 0.0
+
+            # 20 日最高（不含未来）
+            navs_window = []
+            for j in range(max(0, idx_today - 19), idx_today + 1):
+                v = self.get_nav(code, trading_days[j])
+                if v is not None:
+                    navs_window.append(v)
+            high_20d = max(navs_window) if navs_window else current_nav
+
+            sector = _infer_sector_local(name)
+            funds[code] = {
+                "name": name,
+                "current_nav": current_nav,
+                "day_return": day_return,
+                "fund_3d_return": fund_3d,
+                "fund_5d_return": fund_5d,
+                "fund_20d_return": fund_20d,
+                "high_20d": high_20d,
+                "sector": sector,
+            }
+
+        return {
+            "hs300_5d_return": hs300_5d,
+            "hs300_20d_return": hs300_20d,
+            "regime_hint": None,
+            "funds": funds,
+            "portfolio_peak_value": self.peak_value,
+        }
+
+    def _positions_for_engine(self, date):
+        """Convert internal positions dict to engine's positions list shape."""
+        out = []
+        for code, p in self.positions.items():
+            buy_date = p.get("buy_date", date)
+            try:
+                hold_days = (
+                    datetime.strptime(date, "%Y-%m-%d")
+                    - datetime.strptime(buy_date, "%Y-%m-%d")
+                ).days
+            except Exception:
+                hold_days = 0
+            out.append({
+                "code": code,
+                "name": p.get("name", ""),
+                "shares": p["shares"],
+                "cost_nav": p["cost_nav"],
+                "sector": _infer_sector_local(p.get("name", "")),
+                "hold_days": hold_days,
+            })
+        return out
+
+    def apply_rules_engine(self, date, trading_days, total_value):
+        """Use DecisionEngine.decide() to drive trades for this day."""
+        market_data = self._build_market_data_for_engine(date, trading_days)
+        positions = self._positions_for_engine(date)
+        packet = self.engine.decide(
+            date=date,
+            market_data=market_data,
+            positions=positions,
+            cash=self.cash,
+            total_value=total_value,
+        )
+
+        # 执行 actions（卖出优先于买入，保持现金充足）
+        sells = [a for a in packet["actions"] if a["action"] == "sell"]
+        buys  = [a for a in packet["actions"] if a["action"] == "buy"]
+
+        for a in sells:
+            shares = a.get("suggested_shares") or 0.0
+            if shares > 0 and a["code"] in self.positions:
+                self.execute_sell(
+                    a["code"], date, shares,
+                    reason=a.get("reason_zh", a.get("rule_label", "")),
+                    rule_name=a.get("rule_id", "engine_sell"),
+                )
+
+        for a in buys:
+            amount = a.get("suggested_amount") or 0.0
+            if amount > 0 and amount <= self.cash:
+                self.execute_buy(
+                    a["code"], date, amount,
+                    reason=a.get("reason_zh", a.get("rule_label", "")),
+                    rule_name=a.get("rule_id", "engine_buy"),
+                )
+
+    # =================================================================
+
     def apply_rules(self, date, trading_days):
         """应用交易规则（决策树 v2.0）"""
         total_value = self.get_portfolio_value(date)
         if total_value <= 0:
             return
 
-        cash_ratio = self.cash / total_value
-        regime = self.get_market_regime(date, trading_days)
-
         # 更新峰值
         if total_value > self.peak_value:
             self.peak_value = total_value
+
+        # Phase 2: 引擎驱动路径 — 把日终数据喂给 DecisionEngine，按其建议交易
+        if self.engine_mode and self.engine and self.account_id:
+            self.apply_rules_engine(date, trading_days, total_value)
+            return
+
+        cash_ratio = self.cash / total_value
+        regime = self.get_market_regime(date, trading_days)
 
         # 根据大盘环境调整参数
         if regime == "牛市":
@@ -1218,6 +1364,7 @@ def cmd_run(args):
         verbose=getattr(args, 'verbose', False),
         db=db,
         strategy_version=strategy_version,
+        engine_mode=getattr(args, 'engine', False),
     )
     sim.run()
     report = sim.generate_report()
@@ -1333,6 +1480,10 @@ def main():
     p_run.add_argument("--funds", help="基金代码，逗号分隔（默认使用预设基金池）")
     p_run.add_argument("--verbose", "-v", action="store_true", help="终端也打印完整每日报告（默认只打印摘要）")
     p_run.add_argument("--strategy", help="决策树版本（默认 v2.0）")
+    p_run.add_argument(
+        "--engine", action="store_true",
+        help="使用 DecisionEngine.decide() 驱动回测（Phase 2 新增；旧路径保留兼容）",
+    )
 
     sub.add_parser("list", help="列出所有回测")
 
