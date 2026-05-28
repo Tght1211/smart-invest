@@ -22,10 +22,11 @@ All position/trade CLIs take `--account <name>` to switch between them.
 
 | Script | Role |
 |---|---|
-| `scripts/db.py` | SQLite schema + CRUD CLI. Defines the `Database` class imported by other scripts. Tables: `accounts`, `positions`, `trades` (with audit fields), `daily_snapshots`, `decision_tree_versions`, `strategy_evolutions`, `simulation_runs`. |
-| `scripts/fetch_fund.py` | Market data via 天天基金/东方财富 public HTTP endpoints (no auth). Subcommands: `market-summary`, `indices`, `sectors`, `estimate`, `nav`, `rank`, `index-kline`, `portfolio-check`, `portfolio-show`, `orders-show`. |
-| `scripts/decision_engine.py` | Loads rules from `decision_tree_versions` table (falls back to `data/decision_tree.json`), runs pre-trade checks, writes audit log on every trade. |
-| `scripts/simulate.py` | Backtest engine ("梦境训练"). Replays historical NAVs day-by-day, **must avoid future leak** — only use data with date ≤ current sim date. Auto-creates a `梦境-<sim_id>` account. |
+| `scripts/db.py` | SQLite schema + CRUD CLI. Defines the `Database` class imported by other scripts. Honours `SMART_INVEST_DB` env var to relocate the DB (used by tests). Tables: `accounts`, `positions`, `trades` (with audit fields), `daily_snapshots`, `decision_tree_versions`, `strategy_evolutions`, `simulation_runs`. |
+| `scripts/fetch_fund.py` | Market data via 天天基金/东方财富 public HTTP endpoints (no auth). Subcommands: `market-summary`, `indices`, `sectors`, `estimate`, `nav`, `rank`, `index-kline`, `portfolio-check`, `portfolio-show`, `orders-show`, **`market-snapshot`**. The `gather_market_snapshot()` function is the data feed for `decide.py`. |
+| `scripts/decision_engine.py` | The rule engine. `DecisionEngine.decide()` returns a structured **decision packet** (schema in `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` §6). 25 unit tests in `tests/test_decision_engine.py` pin its behaviour. Old `check_*` helpers retained for backtest compatibility. |
+| `scripts/decide.py` | **The single decision entry point.** Thin CLI wrapping `fetch_fund.gather_market_snapshot` + `DecisionEngine.decide`. Outputs JSON (default) or Markdown summary. All `SKILL.md` analysis modes route through this. |
+| `scripts/simulate.py` | Backtest engine ("梦境训练"). Replays historical NAVs day-by-day, **must avoid future leak** — only use data with date ≤ current sim date. Auto-creates a `梦境-<sim_id>` account. Phase 2 will refactor it to call `DecisionEngine.decide()` directly. |
 | `scripts/send_email.py` | QQ-SMTP HTML email. Has `check` / `setup` / `setup --no-email` / `test` / `send` / `trade-notify` subcommands. `trade-notify` MUST fire after every buy/sell. |
 
 Decision rules are versioned: `data/decision_tree.json` is the live ruleset and `decision_tree_versions` table stores history with parent/changelog/reason for each version. The `strategy_evolutions` table records before/after metrics when a version is promoted from a backtest.
@@ -34,7 +35,8 @@ Decision rules are versioned: `data/decision_tree.json` is the live ruleset and 
 
 - **Never edit `data/portfolio.json` / `data/orders.json` directly.** Use `db.py add-position` / `remove-position` / `add-order`. `add-position` is upsert-style — it accumulates shares and recomputes weighted-average cost for existing holdings.
 - **Every buy/sell must call `send_email.py trade-notify`** after the DB write succeeds. The skill prompt enforces this; the Python side does not.
-- **Stdlib only.** If you find yourself wanting `requests`/`pandas`/etc., use `urllib.request` / built-in `sqlite3` / hand-rolled CSV like the rest of the codebase does.
+- **Decisions go through `scripts/decide.py`.** At runtime, Claude does not independently apply buy/sell rules — the engine produces a structured decision packet; Claude translates it. If you want to change a rule, change `decision_engine.py` + add a unit test, not `SKILL.md` prose.
+- **Stdlib only — including tests.** Tests use `unittest`, not `pytest`. If you find yourself wanting `requests`/`pandas`/etc., use `urllib.request` / built-in `sqlite3` / hand-rolled CSV like the rest of the codebase does.
 - **No future leak in `simulate.py`.** Any new feature added to the simulator must only access data dated ≤ the current simulation day.
 
 ## Common commands
@@ -55,6 +57,19 @@ python3 scripts/db.py evolutions
 python3 scripts/fetch_fund.py market-summary
 python3 scripts/fetch_fund.py portfolio-check --account 主线
 python3 scripts/fetch_fund.py nav 110011 --days 60
+python3 scripts/fetch_fund.py market-snapshot --account 主线   # aggregated feed for decide.py
+
+# Run live decision engine
+python3 scripts/decide.py run --account 主线 --format md
+python3 scripts/decide.py run --account 主线 --format json
+
+# Tests (stdlib unittest, no pytest)
+python3 -m unittest discover tests -v
+python3 -m unittest tests.test_decision_engine -v
+
+# Run with a sandboxed DB (avoids touching the real one)
+SMART_INVEST_DB=/tmp/sandbox.db python3 scripts/db.py init
+SMART_INVEST_DB=/tmp/sandbox.db python3 scripts/decide.py run --account demo
 
 # Backtest
 python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 50000
@@ -66,7 +81,12 @@ python3 scripts/send_email.py check       # CONFIGURED / DISABLED / NOT_CONFIGUR
 python3 scripts/send_email.py test
 ```
 
-No test suite, linter, or build step exists. Verification is by running the CLI commands above and checking output.
+**Test suite**: `tests/test_decision_engine.py` (25 tests pinning engine rules) + `tests/test_decide_cli.py` (CLI smoke test). All stdlib `unittest`. No linter or build step.
+
+**Design docs** (Phase 1+):
+- Spec: `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` — describes the decision-packet contract, rule priority, confidence formula, error handling.
+- Plan: `docs/superpowers/plans/2026-05-28-smart-invest-phase1.md` — TDD implementation plan.
+- Phase 2-4 roadmap is in the spec's §14 "路线图".
 
 ## When the skill prompt asks you to do something
 
