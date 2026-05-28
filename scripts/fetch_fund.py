@@ -555,6 +555,185 @@ def cmd_market_summary(args):
             print(f"  {i:>2}. {name}: {pct:+.2f}%")
 
 
+SECTOR_KEYWORDS = {
+    "科技": ["半导体", "芯片", "AI", "人工智能", "信息科技", "数字经济",
+              "电子", "传媒", "科技"],
+    "消费": ["白酒", "食品", "医药", "消费"],
+    "新能源": ["光伏", "锂电", "新能源"],
+    "金融": ["银行", "券商", "保险"],
+    "资源": ["黄金", "有色", "煤炭", "石油"],
+    "宽基": ["沪深300", "中证500", "创业板", "上证50"],
+    "海外": ["纳斯达克", "标普", "QDII", "港股", "纳指"],
+}
+
+
+def _infer_sector(name):
+    if not name:
+        return "其他"
+    for sector, kws in SECTOR_KEYWORDS.items():
+        for kw in kws:
+            if kw in name:
+                return sector
+    return "其他"
+
+
+def _hs300_returns():
+    """Return (5d_return, 20d_return) for HS300. (None, None) on fetch failure."""
+    try:
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            "secid=1.000300&fields1=f1,f2,f3"
+            "&fields2=f51,f52,f53,f54,f55,f56"
+            f"&klt=101&fqt=0&beg={start_date}&end={end_date}"
+        )
+        text = _get(url)
+        if not text:
+            return None, None
+        data = json.loads(text)
+        klines = data.get("data", {}).get("klines", [])
+        if len(klines) < 21:
+            return None, None
+        closes = [float(k.split(",")[2]) for k in klines]
+        latest = closes[-1]
+        five_ago = closes[-6]
+        twenty_ago = closes[-21]
+        return (
+            (latest - five_ago) / five_ago,
+            (latest - twenty_ago) / twenty_ago,
+        )
+    except Exception:
+        return None, None
+
+
+def _fund_snapshot(code, name, sector):
+    """Fetch latest snapshot for one fund. Returns dict or None if data missing."""
+    try:
+        gz_url = f"http://fundgz.1234567.com.cn/js/{code}.js"
+        gz_text = _get(gz_url)
+        gz = _parse_jsonp(gz_text) if gz_text else None
+        if gz:
+            current_nav = float(gz.get("gsz") or gz.get("dwjz") or 0.0)
+            day_return = float(gz.get("gszzl") or 0.0) / 100.0
+            display_name = name or gz.get("name", "")
+        else:
+            current_nav = 0.0
+            day_return = 0.0
+            display_name = name or ""
+
+        nav_url = (
+            f"https://api.fund.eastmoney.com/f10/lsjz?"
+            f"fundCode={code}&pageIndex=1&pageSize=25"
+        )
+        nav_text = _get(
+            nav_url,
+            headers={"Referer": "https://fundf10.eastmoney.com/"},
+        )
+        navs = []
+        if nav_text:
+            try:
+                nav_data = json.loads(nav_text)
+                items = nav_data.get("Data", {}).get("LSJZList", [])
+                navs = [float(i["DWJZ"]) for i in items if i.get("DWJZ")]
+            except Exception:
+                navs = []
+
+        if not current_nav and navs:
+            current_nav = navs[0]
+
+        def _ret(n):
+            return ((current_nav - navs[n]) / navs[n]) if len(navs) > n and navs[n] else 0.0
+
+        if not current_nav:
+            return None  # genuinely missing — engine will emit data_missing alert
+
+        return {
+            "name": display_name,
+            "current_nav": current_nav,
+            "day_return": day_return,
+            "fund_3d_return": _ret(3),
+            "fund_5d_return": _ret(5),
+            "fund_20d_return": _ret(20),
+            "high_20d": max(navs[:20]) if len(navs) >= 20 else current_nav,
+            "sector": sector or _infer_sector(display_name),
+        }
+    except Exception:
+        return None
+
+
+def gather_market_snapshot(account_name="主线", date=None):
+    """Aggregate inputs DecisionEngine.decide() needs.
+
+    Returns dict with hs300 returns + per-fund snapshots for portfolio + watchlist.
+    Each missing fund becomes None — engine emits data_missing alert for those.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPT_DIR := Path(__file__).resolve().parent))
+    from db import Database
+
+    db = Database()
+    try:
+        hs300_5d, hs300_20d = _hs300_returns()
+
+        cur = db.conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM accounts WHERE name = ?", (account_name,)
+        ).fetchone()
+        if not row:
+            return {"error": f"account '{account_name}' not found"}
+        account_id = row["id"]
+
+        positions = cur.execute(
+            "SELECT code, name, sector FROM positions WHERE account_id = ?",
+            (account_id,),
+        ).fetchall()
+
+        funds = {}
+        for p in positions:
+            snap = _fund_snapshot(p["code"], p["name"], p["sector"])
+            if snap:
+                funds[p["code"]] = snap
+
+        # Watchlist: simulate.py's DEFAULT_FUNDS, if importable
+        try:
+            from simulate import DEFAULT_FUNDS  # type: ignore
+            for code, name in DEFAULT_FUNDS.items():
+                if code not in funds:
+                    snap = _fund_snapshot(code, name, None)
+                    if snap:
+                        funds[code] = snap
+        except Exception:
+            pass
+
+        # Peak value: use max(total_value) from daily_snapshots if available
+        peak = None
+        try:
+            row = cur.execute(
+                "SELECT MAX(total_value) AS peak FROM daily_snapshots "
+                "WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            peak = row["peak"] if row and row["peak"] else None
+        except Exception:
+            peak = None
+
+        return {
+            "hs300_5d_return": hs300_5d,
+            "hs300_20d_return": hs300_20d,
+            "regime_hint": None,
+            "funds": funds,
+            "portfolio_peak_value": peak,
+        }
+    finally:
+        db.close()
+
+
+def cmd_market_snapshot(args):
+    snap = gather_market_snapshot(account_name=args.account, date=args.date)
+    print(json.dumps(snap, ensure_ascii=False, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description="基金数据抓取工具 — Smart Invest Skill")
     sub = parser.add_subparsers(dest="command", help="子命令")
@@ -601,6 +780,14 @@ def main():
     # market-summary
     sub.add_parser("market-summary", help="市场全景（指数+板块）")
 
+    # market-snapshot — Phase 1: 喂给 decision_engine 的聚合数据
+    p_snap = sub.add_parser(
+        "market-snapshot",
+        help="聚合大盘+持仓+候选池数据，喂给决策引擎",
+    )
+    p_snap.add_argument("--account", "-a", default="主线", help="账户名称")
+    p_snap.add_argument("--date", default=None, help="日期（YYYY-MM-DD）")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -617,6 +804,7 @@ def main():
         "portfolio-show": cmd_portfolio_show,
         "orders-show": cmd_orders_show,
         "market-summary": cmd_market_summary,
+        "market-snapshot": cmd_market_snapshot,
     }
 
     handler = cmd_map.get(args.command)
