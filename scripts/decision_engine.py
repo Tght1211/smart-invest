@@ -87,14 +87,33 @@ class DecisionEngine:
         }
 
     def _compute_market_regime(self, market_data):
-        """Filled in Task 4."""
+        """Classify market regime by HS300 20-day return.
+
+        - 牛市 : 20d > +5%   → position_cap 95%, single_cap 30%, stop -15%
+        - 熊市 : 20d < -10%  → position_cap 60%, single_cap 15%, stop -8%
+        - 震荡市: otherwise    → position_cap 85%, single_cap 25%, stop -12%
+        - unknown: 20d is None → conservative posture, blocks new buys
+        """
+        hs300_20d_raw = market_data.get("hs300_20d_return")
+        hs300_5d = market_data.get("hs300_5d_return") or 0.0
+        if hs300_20d_raw is None:
+            label, pcap, scap, sl = "unknown", 0.85, 0.25, -0.12
+            hs300_20d = 0.0
+        else:
+            hs300_20d = hs300_20d_raw
+            if hs300_20d > 0.05:
+                label, pcap, scap, sl = "牛市", 0.95, 0.30, -0.15
+            elif hs300_20d < -0.10:
+                label, pcap, scap, sl = "熊市", 0.60, 0.15, -0.08
+            else:
+                label, pcap, scap, sl = "震荡市", 0.85, 0.25, -0.12
         return {
-            "label": "unknown",
-            "hs300_5d_return": 0.0,
-            "hs300_20d_return": 0.0,
-            "position_cap": 0.85,
-            "single_cap": 0.25,
-            "stop_loss_threshold": -0.12,
+            "label": label,
+            "hs300_5d_return": hs300_5d,
+            "hs300_20d_return": hs300_20d,
+            "position_cap": pcap,
+            "single_cap": scap,
+            "stop_loss_threshold": sl,
         }
 
     def _compute_portfolio_snapshot(self, positions, market_data, cash, total_value):

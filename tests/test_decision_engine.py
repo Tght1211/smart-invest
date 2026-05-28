@@ -66,5 +66,30 @@ class PacketSchemaTest(DecisionEngineTestBase):
         self.assertIsInstance(packet["alerts"], list)
 
 
+class MarketRegimeTest(DecisionEngineTestBase):
+    def test_bull_market(self):
+        md = make_market_data(hs300_20d_return=0.08)
+        r = self._decide(md, positions=[])["market_regime"]
+        self.assertEqual(r["label"], "牛市")
+        self.assertEqual(r["position_cap"], 0.95)
+        self.assertEqual(r["single_cap"], 0.30)
+        self.assertEqual(r["stop_loss_threshold"], -0.15)
+
+    def test_bear_market(self):
+        md = make_market_data(hs300_20d_return=-0.12)
+        r = self._decide(md, positions=[])["market_regime"]
+        self.assertEqual(r["label"], "熊市")
+        self.assertEqual(r["position_cap"], 0.60)
+        self.assertEqual(r["single_cap"], 0.15)
+        self.assertEqual(r["stop_loss_threshold"], -0.08)
+
+    def test_chop_market(self):
+        md = make_market_data(hs300_20d_return=0.02)
+        r = self._decide(md, positions=[])["market_regime"]
+        self.assertEqual(r["label"], "震荡市")
+        self.assertEqual(r["position_cap"], 0.85)
+        self.assertEqual(r["single_cap"], 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()
