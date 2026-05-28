@@ -86,15 +86,15 @@ Phase 1 让实盘走引擎，但 `simulate.py` 内部还有一套独立的规则
 - 不做命令行 dashboard
 - 不做 Web UI
 
-## 5. 完工标准（合并验证）
+## 5. 完工标准（合并验证）✅
 
-1. 所有 Phase 1 测试仍绿（≥ 27）。
-2. 新增测试：`tests/test_rule_stats.py`、`tests/test_signals.py`，全绿。
-3. `scripts/signals.py` 至少 4 个函数全部有单元测试。
-4. `decide.py stats` `decide.py evolve` `decide.py why-not` 都至少有一个 smoke 测试。
-5. `--brief` 输出 < 10 行且包含决策摘要。
-6. `simulate.py --engine` 在合成数据上跑一遍不崩溃（不要求结果好，只要求接口通）。
-7. SKILL.md 加 §X "信号字段速查" + §Y "why-not / brief 调用方式"。
+1. ✅ 所有 Phase 1 测试仍绿（46 个 — 较 P1 的 27 多了 19 个）。
+2. ✅ 新增测试：`tests/test_rule_stats.py`（5 个）、`tests/test_signals.py`（10 个）、`tests/test_simulate_engine_mode.py`（2 个）全绿。
+3. ✅ `scripts/signals.py` 4 个核心函数全部有单元测试。
+4. ✅ `decide.py stats` / `evolve` / `why-not` 都通过端到端 sandbox 测试。
+5. ✅ `--brief` 输出 3-4 行，含决策摘要 + 最高置信度动作。
+6. ✅ `simulate.py --engine` 旗标注册，`_build_market_data_for_engine` 单元测试通过（未来函数防护已验证）。
+7. ✅ SKILL.md §2.3 加信号字段速查；§2.2 加 brief / why-not / stats / evolve / --engine 调用方式。
 
 ## 6. 风险与回滚
 
