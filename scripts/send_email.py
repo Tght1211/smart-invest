@@ -582,6 +582,33 @@ def cmd_test(args):
     send_email(subject, body, html)
 
 
+def _interactive_setup():
+    """Phase 4: 交互式 setup — Claude 直接调时其实不会用，但用户在 shell
+    里跑 send_email.py setup --interactive 时会被引导逐步填写。"""
+    print("\n=== Smart-Invest 邮件配置向导 ===\n")
+    print("此向导帮你设置 QQ 邮箱 SMTP。需要先在 QQ 邮箱网页版开启 SMTP 服务并生成授权码。")
+    print("位置：QQ 邮箱 → 设置 → 账户 → POP3/IMAP/SMTP… → 开启 → 生成授权码")
+    print("（授权码是一串 16 位字母，跟登录密码不一样）\n")
+
+    sender = input("发件邮箱（你的 QQ 邮箱地址）: ").strip()
+    if not sender or "@" not in sender:
+        print("[ERROR] 邮箱格式不正确", file=sys.stderr)
+        return None
+    password = input("SMTP 授权码: ").strip()
+    if not password or len(password) < 8:
+        print("[ERROR] 授权码看起来太短（应为 16 位字母）", file=sys.stderr)
+        return None
+    receivers_raw = input(
+        "收件邮箱（多个用空格分隔；留空则发到自己）: "
+    ).strip()
+    receivers = receivers_raw.split() if receivers_raw else [sender]
+    for r in receivers:
+        if "@" not in r:
+            print(f"[ERROR] 收件邮箱 '{r}' 格式不正确", file=sys.stderr)
+            return None
+    return sender, password, receivers
+
+
 def cmd_setup(args):
     """配置邮件（首次引导或修改配置）"""
     if args.no_email:
@@ -592,8 +619,21 @@ def cmd_setup(args):
         print("[OK] 邮件功能已关闭")
         return
 
+    if args.interactive:
+        result = _interactive_setup()
+        if result is None:
+            return
+        args.sender, args.password, args.receiver = result
+
     if not args.sender or not args.password or not args.receiver:
-        print("[ERROR] 需要 --sender、--password、--receiver 参数", file=sys.stderr)
+        print(
+            "[ERROR] 邮件配置不完整。可选：\n"
+            "  1. 交互式引导：python3 scripts/send_email.py setup --interactive\n"
+            "  2. 命令行参数：python3 scripts/send_email.py setup "
+            "--sender X@qq.com --password 授权码 --receiver Y@qq.com\n"
+            "  3. 关闭邮件：python3 scripts/send_email.py setup --no-email",
+            file=sys.stderr,
+        )
         return
 
     receivers = args.receiver if isinstance(args.receiver, list) else [args.receiver]
@@ -619,13 +659,35 @@ def cmd_check(args):
     """检查邮件配置状态"""
     if not CONFIG_FILE.exists():
         print("NOT_CONFIGURED")
+        if getattr(args, 'verbose', False):
+            print(
+                "→ 运行以下任一命令开始：\n"
+                "    python3 scripts/send_email.py setup --interactive\n"
+                "    python3 scripts/send_email.py setup --no-email",
+                file=sys.stderr,
+            )
         return
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = json.load(f)
     if not config.get("enabled", False):
         print("DISABLED")
+        if getattr(args, 'verbose', False):
+            print(
+                "→ 邮件已关闭。如需重新启用，跑 setup --interactive",
+                file=sys.stderr,
+            )
     else:
         print("CONFIGURED")
+        if getattr(args, 'verbose', False):
+            smtp = config.get("smtp", {})
+            recv = smtp.get("receiver", [])
+            if isinstance(recv, str):
+                recv = [recv]
+            print(
+                f"→ 发件: {smtp.get('sender', '?')}\n"
+                f"→ 收件: {', '.join(recv) or '?'}",
+                file=sys.stderr,
+            )
 
 
 def main():
@@ -654,8 +716,16 @@ def main():
     p_setup.add_argument("--server", default="smtp.qq.com", help="SMTP 服务器")
     p_setup.add_argument("--port", type=int, default=465, help="SMTP 端口")
     p_setup.add_argument("--no-email", action="store_true", help="关闭邮件功能")
+    p_setup.add_argument(
+        "--interactive", "-i", action="store_true",
+        help="交互式向导（命令行直接跑时推荐）",
+    )
 
-    sub.add_parser("check", help="检查邮件配置状态")
+    p_check = sub.add_parser("check", help="检查邮件配置状态")
+    p_check.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="额外打印行动建议或当前配置摘要",
+    )
 
     args = parser.parse_args()
     if not args.command:
