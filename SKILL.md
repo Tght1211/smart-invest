@@ -77,7 +77,58 @@ python3 scripts/decide.py run --account 主线 --format json
 
 模式 C（单只基金）不需要走引擎，直接用 `fetch_fund.py estimate <code>` + `nav <code> --days 60` 给出趋势分析即可。
 
-### 2.3 决策包的使用纪律
+**模式 B（快速看看）建议用 `--format brief`** —— 输出只有 3-5 行，省去完整 Markdown 报告的视觉负担：
+
+```bash
+python3 scripts/decide.py run --account 主线 --format brief
+```
+
+输出示例：
+```
+📅 2026-05-28 账户 主线 — 大盘 震荡市 (HS300 5d +2.7%)
+💰 总 ¥28,300 | 现金 22% | 持仓 78%
+🎯 引擎建议：buy 1 | hold 5
+🟢 低吸: 半导体ETF国联安 ¥1500 (conf 0.78)
+```
+
+**用户问"为什么没建议买 XXX"时**，直接用 `why-not`：
+
+```bash
+python3 scripts/decide.py why-not --account 主线 --code 512480
+```
+
+它会查 `actions / blocked_actions / alerts`，分别答"其实有建议"/"被拦截"/"数据缺失"/"未触发规则"。
+
+**查看规则历史表现**：
+
+```bash
+python3 scripts/decide.py stats --account 主线
+```
+
+按 `rule_id` 分组的胜率 / 期望 / 均盈 / 均亏。Phase 2 提供。
+
+**让回测复用同一个引擎**：
+
+```bash
+python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 50000 --engine
+```
+
+`--engine` 旗标让回测每天调 `DecisionEngine.decide()` 而不是 simulate.py 的内置规则。验证实盘策略最快的方式。
+
+### 2.3 信号字段（Phase 3 新增，观测用）
+
+`actions[].context.signals` 含 4 个技术指标，**不影响决策触发，只供报告显示**：
+
+| 字段 | 含义 | 解读 |
+|------|------|------|
+| `rsi_14` | 14 日 RSI | <30 超卖，>70 超买，30-70 中性 |
+| `macd_hist` | MACD 柱状值 | 正 = 多头能量增强；负 = 空头 |
+| `ma20_slope` | 20 日均线最近 5 天平均斜率 | 正 = 上行；负 = 下行 |
+| `breakout_20d` | 突破 20 日新高 | true = 当前价 > 近 20 天最高 |
+
+在报告里可加一句"技术面：RSI 28（超卖）、MA20 斜率 -0.2%（下行）"等帮助用户理解。
+
+### 2.4 决策包的使用纪律
 
 - ✅ `actions[]` 是建议清单，**你不要私自加减项**。如果用户问"为什么没建议买 XXX"，去 `blocked_actions[]` 找原因。
 - ✅ `confidence` 决定语气：

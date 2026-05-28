@@ -25,8 +25,9 @@ All position/trade CLIs take `--account <name>` to switch between them.
 | `scripts/db.py` | SQLite schema + CRUD CLI. Defines the `Database` class imported by other scripts. Honours `SMART_INVEST_DB` env var to relocate the DB (used by tests). Tables: `accounts`, `positions`, `trades` (with audit fields), `daily_snapshots`, `decision_tree_versions`, `strategy_evolutions`, `simulation_runs`. |
 | `scripts/fetch_fund.py` | Market data via 天天基金/东方财富 public HTTP endpoints (no auth). Subcommands: `market-summary`, `indices`, `sectors`, `estimate`, `nav`, `rank`, `index-kline`, `portfolio-check`, `portfolio-show`, `orders-show`, **`market-snapshot`**. The `gather_market_snapshot()` function is the data feed for `decide.py`. |
 | `scripts/decision_engine.py` | The rule engine. `DecisionEngine.decide()` returns a structured **decision packet** (schema in `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` §6). 25 unit tests in `tests/test_decision_engine.py` pin its behaviour. Old `check_*` helpers retained for backtest compatibility. |
-| `scripts/decide.py` | **The single decision entry point.** Thin CLI wrapping `fetch_fund.gather_market_snapshot` + `DecisionEngine.decide`. Outputs JSON (default) or Markdown summary. All `SKILL.md` analysis modes route through this. |
-| `scripts/simulate.py` | Backtest engine ("梦境训练"). Replays historical NAVs day-by-day, **must avoid future leak** — only use data with date ≤ current sim date. Auto-creates a `梦境-<sim_id>` account. Phase 2 will refactor it to call `DecisionEngine.decide()` directly. |
+| `scripts/decide.py` | **The single decision entry point.** Thin CLI wrapping `fetch_fund.gather_market_snapshot` + `DecisionEngine.decide`. Subcommands: `run` (JSON/md/brief), `stats` (per-rule win/loss), `evolve` (writes strategy_evolutions), `why-not` (explains why a code isn't in actions). All `SKILL.md` analysis modes route through this. |
+| `scripts/signals.py` | Phase 3 technical indicators (pure stdlib): `compute_rsi`, `compute_macd`, `compute_ma_slope`, `compute_breakout`, `attach_signals`. Used by `fetch_fund._fund_snapshot` to enrich each fund with a `signals` block. **Not used by any rule yet** — attached to `actions[].context.signals` for visibility; new rules gated on backtest evidence (P5). |
+| `scripts/simulate.py` | Backtest engine ("梦境训练"). Replays historical NAVs day-by-day, **must avoid future leak** — only use data with date ≤ current sim date. Auto-creates a `梦境-<sim_id>` account. Phase 2: `--engine` flag drives backtest via `DecisionEngine.decide()` (old inline rule path retained for compatibility). |
 | `scripts/send_email.py` | QQ-SMTP HTML email. Has `check` / `setup` / `setup --no-email` / `test` / `send` / `trade-notify` subcommands. `trade-notify` MUST fire after every buy/sell. |
 
 Decision rules are versioned: `data/decision_tree.json` is the live ruleset and `decision_tree_versions` table stores history with parent/changelog/reason for each version. The `strategy_evolutions` table records before/after metrics when a version is promoted from a backtest.
@@ -62,6 +63,13 @@ python3 scripts/fetch_fund.py market-snapshot --account 主线   # aggregated fe
 # Run live decision engine
 python3 scripts/decide.py run --account 主线 --format md
 python3 scripts/decide.py run --account 主线 --format json
+python3 scripts/decide.py run --account 主线 --format brief        # 3-5 line summary
+python3 scripts/decide.py why-not --account 主线 --code 512480     # explain non-recommendation
+python3 scripts/decide.py stats --account 主线                     # per-rule win rate / expectancy
+python3 scripts/decide.py evolve --account 主线 --to-version v2.1  # write strategy_evolutions row
+
+# Backtest with engine
+python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 50000 --engine
 
 # Tests (stdlib unittest, no pytest)
 python3 -m unittest discover tests -v
