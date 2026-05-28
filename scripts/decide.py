@@ -211,7 +211,9 @@ def cmd_run(args):
                 total_value=total_value,
             )
 
-            if args.format == "md":
+            if args.format == "brief":
+                print(_format_brief(packet))
+            elif args.format == "md":
                 print(_format_md(packet))
             else:
                 print(json.dumps(packet, ensure_ascii=False, indent=2))
@@ -222,6 +224,157 @@ def cmd_run(args):
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 3
+
+
+def _format_brief(packet):
+    """Phase 4: 3-5 line condensed summary for the "快速看看" mode."""
+    r = packet["market_regime"]
+    s = packet["portfolio_snapshot"]
+    lines = [
+        f"📅 {packet['date']} 账户 {packet['account']} — 大盘 {r['label']} "
+        f"(HS300 5d {r['hs300_5d_return']*100:+.1f}%)",
+        f"💰 总 ¥{s['total_value']:,.0f} | 现金 {s['cash_pct']*100:.0f}% | "
+        f"持仓 {s['position_pct']*100:.0f}%",
+    ]
+    sm = packet["summary"]
+    counts = sm["action_count"]
+    if any(counts.values()):
+        actions_line = " | ".join(
+            f"{k} {v}" for k, v in counts.items() if v > 0
+        )
+        lines.append(f"🎯 引擎建议：{actions_line}")
+    else:
+        lines.append("🎯 引擎建议：无操作（hold）")
+    # Top action
+    hi = sm.get("highest_confidence_action")
+    if hi:
+        top = next(
+            a for a in packet["actions"]
+            if a["code"] == hi["code"] and a["action"] == hi["action"]
+        )
+        sym = {"buy": "🟢", "sell": "🔴", "watch": "🟡", "hold": "⏸"}.get(
+            top["action"], "•",
+        )
+        if top["action"] == "buy":
+            detail = f"¥{top['suggested_amount']:.0f}"
+        elif top["action"] == "sell":
+            detail = f"{top['suggested_shares']:.0f} 份"
+        else:
+            detail = ""
+        lines.append(
+            f"{sym} {top['rule_label']}: {top['name']} {detail} "
+            f"(conf {top['confidence']:.2f})"
+        )
+    if packet["alerts"]:
+        lines.append(f"⚠️  {packet['alerts'][0]['reason_zh']}")
+    return "\n".join(lines)
+
+
+def cmd_why_not(args):
+    """Phase 4: 用户问"为什么没建议买 XXX"，快速给答案."""
+    # 跑一次 decide，然后查 blocked/actions/alerts 看代码是否出现
+    db = Database()
+    try:
+        row = db.conn.execute(
+            "SELECT id FROM accounts WHERE name = ?", (args.account,)
+        ).fetchone()
+        if not row:
+            print(f"[ERROR] account '{args.account}' not found", file=sys.stderr)
+            return 2
+        account_id = row["id"]
+
+        snap = fetch_fund.gather_market_snapshot(account_name=args.account)
+        if isinstance(snap, dict) and "error" in snap:
+            print(snap["error"], file=sys.stderr)
+            return 2
+
+        # If user's target code isn't in the snapshot's funds, we add it ourselves
+        funds = snap.get("funds", {}) or {}
+        if args.code not in funds:
+            extra = fetch_fund._fund_snapshot(args.code, None, None)
+            if extra:
+                funds[args.code] = extra
+                snap["funds"] = funds
+
+        positions = []
+        for r in db.conn.execute(
+            "SELECT code, name, shares, cost_nav, sector, buy_date "
+            "FROM positions WHERE account_id = ?",
+            (account_id,),
+        ):
+            positions.append({
+                "code": r["code"], "name": r["name"],
+                "shares": r["shares"], "cost_nav": r["cost_nav"],
+                "sector": r["sector"], "hold_days": 0,
+            })
+        cash_row = db.conn.execute(
+            "SELECT cash FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        cash = cash_row["cash"] if cash_row else 0.0
+        position_value = sum(
+            p["shares"] * (funds.get(p["code"], {}) or {}).get("current_nav", p["cost_nav"])
+            for p in positions
+        )
+        total_value = cash + position_value
+        engine = DecisionEngine(db, account_id)
+        packet = engine.decide(
+            date=datetime.now().strftime("%Y-%m-%d"),
+            market_data=snap, positions=positions,
+            cash=cash, total_value=total_value,
+        )
+
+        code = args.code
+        print(f"# 为什么没建议买 {code}\n")
+
+        # 1. Was it actively recommended?
+        actions = [a for a in packet["actions"] if a["code"] == code]
+        if any(a["action"] == "buy" for a in actions):
+            buy = [a for a in actions if a["action"] == "buy"][0]
+            print(f"✅ 引擎其实是有建议买的：")
+            print(f"   - 规则：{buy['rule_label']} (`{buy['rule_id']}`)")
+            print(f"   - 金额：¥{buy['suggested_amount']:.0f}")
+            print(f"   - 置信度：{buy['confidence']:.2f}")
+            print(f"   - 理由：{buy['reason_zh']}")
+            return 0
+
+        # 2. Was it blocked?
+        blocked = [b for b in packet["blocked_actions"] if b["code"] == code]
+        if blocked:
+            print(f"❌ 引擎想买但被前置检查拦截：")
+            for b in blocked:
+                print(f"   - 拦截规则：`{b['blocked_by']}`")
+                print(f"   - 理由：{b['reason_zh']}")
+            return 0
+
+        # 3. Was data missing?
+        data_alerts = [
+            a for a in packet["alerts"]
+            if a.get("id") == "data_missing" and a.get("code") == code
+        ]
+        if data_alerts:
+            print(f"⚠️ 该基金数据缺失，引擎跳过了决策：")
+            print(f"   - {data_alerts[0]['reason_zh']}")
+            return 0
+
+        # 4. Otherwise: low_buy condition was not met
+        fund = funds.get(code)
+        if fund:
+            day_r = fund.get("day_return", 0.0)
+            r5 = fund.get("fund_5d_return", 0.0)
+            print(
+                f"ℹ️ 该基金未触发任何买入规则（low_buy 要求当日跌 > 3%）："
+            )
+            print(f"   - 当日涨跌：{day_r * 100:+.2f}%")
+            print(f"   - 近 5 天涨跌：{r5 * 100:+.2f}%")
+            print(f"   - 现金占比：{packet['portfolio_snapshot']['cash_pct']*100:.1f}%")
+            print(f"   - 大盘环境：{packet['market_regime']['label']}")
+            if day_r > -0.03:
+                print(f"   → 没有跌得够深以触发低吸；可以加入观察池等待回调。")
+        else:
+            print(f"❓ 基金 {code} 不在持仓也不在候选池，引擎未评估。")
+        return 0
+    finally:
+        db.close()
 
 
 def cmd_stats(args):
@@ -381,8 +534,8 @@ def main():
         help="日期 YYYY-MM-DD（默认: 今天）",
     )
     p.add_argument(
-        "--format", choices=["json", "md"], default="json",
-        help="输出格式（默认: json）",
+        "--format", choices=["json", "md", "brief"], default="json",
+        help="输出格式（默认: json；brief 是 3-5 行摘要）",
     )
     p.set_defaults(func=cmd_run)
 
@@ -409,6 +562,14 @@ def main():
         help="trigger_detail（若来自某次回测可填 sim_id）",
     )
     p_evolve.set_defaults(func=cmd_evolve)
+
+    p_why = sub.add_parser(
+        "why-not",
+        help="为什么没建议买 XXX？查 blocked_actions / alerts / 规则未触发原因",
+    )
+    p_why.add_argument("--account", default="主线", help="账户名称")
+    p_why.add_argument("--code", required=True, help="基金代码")
+    p_why.set_defaults(func=cmd_why_not)
 
     args = ap.parse_args()
     sys.exit(args.func(args))
