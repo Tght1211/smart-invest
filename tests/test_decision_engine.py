@@ -66,6 +66,40 @@ class PacketSchemaTest(DecisionEngineTestBase):
         self.assertIsInstance(packet["alerts"], list)
 
 
+class PortfolioSnapshotTest(DecisionEngineTestBase):
+    def test_snapshot_empty(self):
+        packet = self._decide(make_market_data(), positions=[],
+                              cash=10000.0, total_value=10000.0)
+        snap = packet["portfolio_snapshot"]
+        self.assertEqual(snap["total_value"], 10000.0)
+        self.assertEqual(snap["cash"], 10000.0)
+        self.assertEqual(snap["cash_pct"], 1.0)
+        self.assertEqual(snap["position_value"], 0.0)
+        self.assertEqual(snap["sectors"], {})
+        self.assertEqual(snap["by_position"], [])
+
+    def test_snapshot_single_position(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=2.34, sector="科技",
+        )]
+        packet = self._decide(make_market_data(), positions=positions,
+                              cash=7700.0, total_value=10000.0)
+        snap = packet["portfolio_snapshot"]
+        # 1000 shares * 2.30 (current_nav from market_data) = 2300
+        self.assertAlmostEqual(snap["position_value"], 2300.0, places=2)
+        self.assertAlmostEqual(snap["cash_pct"], 0.77, places=3)
+        self.assertAlmostEqual(snap["sectors"]["科技"], 0.23, places=3)
+        self.assertEqual(len(snap["by_position"]), 1)
+        p = snap["by_position"][0]
+        self.assertEqual(p["code"], "512480")
+        self.assertEqual(p["shares"], 1000.0)
+        self.assertEqual(p["cost_nav"], 2.34)
+        self.assertEqual(p["current_nav"], 2.30)
+        self.assertAlmostEqual(p["pct_of_total"], 0.23, places=3)
+        self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
+
+
 class MarketRegimeTest(DecisionEngineTestBase):
     def test_bull_market(self):
         md = make_market_data(hs300_20d_return=0.08)

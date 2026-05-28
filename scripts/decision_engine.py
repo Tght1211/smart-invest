@@ -117,15 +117,49 @@ class DecisionEngine:
         }
 
     def _compute_portfolio_snapshot(self, positions, market_data, cash, total_value):
-        """Filled in Task 5."""
+        """Aggregate positions: total/cash/position value, sector pct, per-position."""
+        funds = market_data.get("funds", {})
+        by_pos = []
+        sectors = {}
+        position_value = 0.0
+        for pos in positions:
+            code = pos["code"]
+            fund = funds.get(code) or {}
+            nav = fund.get("current_nav", pos["cost_nav"])
+            value = pos["shares"] * nav
+            position_value += value
+            sector = pos.get("sector") or fund.get("sector") or "其他"
+            sectors[sector] = sectors.get(sector, 0.0) + value
+            profit_pct = (
+                (nav - pos["cost_nav"]) / pos["cost_nav"]
+                if pos["cost_nav"] else 0.0
+            )
+            by_pos.append({
+                "code": code,
+                "name": pos.get("name", fund.get("name", "")),
+                "shares": pos["shares"],
+                "cost_nav": pos["cost_nav"],
+                "current_nav": nav,
+                "value": value,
+                "pct_of_total": value / total_value if total_value else 0.0,
+                "profit_pct": profit_pct,
+                "hold_days": pos.get("hold_days", 0),
+                "sector": sector,
+            })
+        sectors_pct = {
+            k: (v / total_value if total_value else 0.0)
+            for k, v in sectors.items()
+        }
         return {
             "total_value": total_value,
             "cash": cash,
             "cash_pct": cash / total_value if total_value else 0.0,
-            "position_value": total_value - cash,
-            "position_pct": (total_value - cash) / total_value if total_value else 0.0,
-            "sectors": {},
-            "by_position": [],
+            "position_value": position_value,
+            "position_pct": (
+                position_value / total_value if total_value else 0.0
+            ),
+            "sectors": sectors_pct,
+            "by_position": by_pos,
         }
 
     def _evaluate_rules(self, date, market_data, positions, snapshot,
