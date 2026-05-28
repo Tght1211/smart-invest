@@ -428,6 +428,32 @@ class DecisionEngine:
             f"盈利 {profit_pct * 100:.1f}% ≥ 20%，减仓 25%。",
         )
 
+    # ---------- confidence scoring ----------
+
+    def _score_confidence(self, action, position=None):
+        """Heuristic confidence in [0, 1]. Phase 2 will calibrate from backtest data."""
+        if action["action"] == "buy":
+            base = 0.5
+            ctx = action.get("context", {})
+            if ctx.get("fund_5d_return", 0.0) <= -0.05:
+                base += 0.15
+            if ctx.get("hs300_5d_return", 0.0) >= 0.03:
+                base += 0.10
+            if position is None:
+                base += 0.10  # new position bonus
+                base += 0.05  # light cash deploy bonus
+            return max(0.0, min(1.0, round(base, 2)))
+        if action["action"] == "sell":
+            base = 0.6
+            profit_pct = action.get("context", {}).get("profit_pct")
+            if profit_pct is not None:
+                if profit_pct >= 0.40:
+                    base += 0.20
+                if profit_pct <= -0.15:
+                    base += 0.20
+            return max(0.0, min(1.0, round(base, 2)))
+        return None
+
     # ---------- main evaluator ----------
 
     def _evaluate_rules(self, date, market_data, positions, snapshot,
@@ -464,6 +490,7 @@ class DecisionEngine:
             if not sell:
                 sell = self._try_take_profit(code, fund, pos)
             if sell:
+                sell["confidence"] = self._score_confidence(sell, position=pos)
                 actions.append(sell)
                 positions_with_sell.add(code)
 
@@ -475,6 +502,10 @@ class DecisionEngine:
                 code, fund, snapshot, regime, cash, total_value,
             )
             if action:
+                existing = next(
+                    (p for p in positions if p["code"] == code), None,
+                )
+                action["confidence"] = self._score_confidence(action, position=existing)
                 if in_drawdown_protection:
                     actions.append({
                         **action,
@@ -482,6 +513,7 @@ class DecisionEngine:
                         "rule_id": "low_buy_deferred_drawdown",
                         "rule_label": "低吸暂缓（回撤保护）",
                         "suggested_amount": 0.0,
+                        "confidence": None,
                         "reason_zh": (
                             action["reason_zh"] + " 但组合回撤 ≥ 10%，暂缓买入。"
                         ),

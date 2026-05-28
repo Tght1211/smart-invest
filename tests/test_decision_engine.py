@@ -100,6 +100,41 @@ class PortfolioSnapshotTest(DecisionEngineTestBase):
         self.assertAlmostEqual(p["profit_pct"], -0.01709, places=4)
 
 
+class ConfidenceTest(DecisionEngineTestBase):
+    def test_confidence_for_low_buy(self):
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"]    = -0.055
+        md["funds"]["512480"]["fund_5d_return"] = -0.09
+        packet = self._decide(md, positions=[],
+                              cash=5000.0, total_value=10000.0)
+        buy = find_action(packet, "512480", "buy")[0]
+        # base 0.5 + 0.15 oversold + 0.10 new + 0.05 light = 0.80
+        self.assertGreaterEqual(buy["confidence"], 0.65)
+        self.assertLessEqual(buy["confidence"], 0.85)
+
+    def test_confidence_for_take_profit_high(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=1.50, sector="科技",
+        )]
+        packet = self._decide(make_market_data(), positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sell = find_action(packet, "512480", "sell")[0]
+        self.assertGreaterEqual(sell["confidence"], 0.75)
+
+    def test_confidence_for_emergency_stop_loss(self):
+        positions = [make_position(
+            "512480", "半导体ETF国联安",
+            shares=1000.0, cost_nav=2.30, sector="科技",
+        )]
+        md = make_market_data()
+        md["funds"]["512480"]["day_return"] = -0.075
+        packet = self._decide(md, positions=positions,
+                              cash=5000.0, total_value=7300.0)
+        sell = find_action(packet, "512480", "sell")[0]
+        self.assertGreaterEqual(sell["confidence"], 0.55)
+
+
 class DrawdownAndBearMarketTest(DecisionEngineTestBase):
     def test_drawdown_protection_downgrades_buys(self):
         md = make_market_data()
