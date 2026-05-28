@@ -274,7 +274,8 @@ hold/watch:
 
 | Phase | 范围 | 启动条件 |
 |---|---|---|
-| **P2 回测-进化闭环** | `simulate.py` 改为复用 `decision_engine.decide()`；每次回测产出按规则分组的胜率/期望/样本量；新增 `decide.py evolve --from-sim <id>` 自动写 `strategy_evolutions` 表 | P1 通过验证清单 + 至少跑过 1 周实盘 |
+| **✅ P1 决策引擎接管** | 完成于 2026-05-28。`decide.py` + 25 个 unit test + SKILL.md 1098→394。详见 commits `2dbc3cb..bf9eab7`。**剩余待补**：模拟环境完成后接入实盘 cron；运行 1 周观察决策包稳定性。 | — |
+| **P2 回测-进化闭环** | `simulate.py` 改为复用 `decision_engine.decide()`；每次回测产出按规则分组的胜率/期望/样本量；新增 `decide.py evolve --from-sim <id>` 自动写 `strategy_evolutions` 表 | P1 通过验证清单 ✅ + 至少跑过 1 周实盘 |
 | **P3 信号扩展** | 新增 `scripts/signals.py` 模块（RSI/MACD/MA 斜率/突破/换手率）；`fetch_fund.py` 加资金流接口；SKILL.md 加 WebSearch 新闻整合规范；决策包 `actions[].context` 扩展技术指标字段 | P2 完成；新信号要先在回测里有正胜率证据才入主线规则 |
 | **P4 UX 深化** | 邮件 HTML 模板重做（响应式 / 支付宝风格优化）；首次引导改为 Claude 智能对话式；错误消息友好化；新增"为什么没建议买入"快捷查询；本地命令行 dashboard（可选） | P3 完成 |
 
