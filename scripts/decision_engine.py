@@ -18,11 +18,14 @@ from db import Database
 class DecisionEngine:
     """决策引擎：执行规则 + 记录审计日志"""
 
-    def __init__(self, db, account_id, strategy_version=None):
+    def __init__(self, db, account_id, strategy_version=None, rules_override=None):
         self.db = db
         self.account_id = account_id
         self.strategy_version = strategy_version or "v2.0"
-        self.rules = self._load_rules()
+        if rules_override is not None:
+            self.rules = rules_override
+        else:
+            self.rules = self._load_rules()
 
     def _load_rules(self):
         """加载决策树规则"""
@@ -47,6 +50,89 @@ class DecisionEngine:
                 if kw in name or kw in code:
                     return sector
         return "其他"
+
+    # ==================== 新统一入口（Phase 1）====================
+
+    def decide(self, date, market_data, positions, cash, total_value):
+        """Single entry point: produce a structured decision packet.
+
+        See docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md §6.
+        """
+        from datetime import datetime
+        row = self.db.conn.execute(
+            "SELECT name FROM accounts WHERE id = ?", (self.account_id,)
+        ).fetchone()
+        account_name = row["name"] if row else "unknown"
+
+        regime = self._compute_market_regime(market_data)
+        snapshot = self._compute_portfolio_snapshot(
+            positions, market_data, cash, total_value,
+        )
+        actions, blocked, alerts = self._evaluate_rules(
+            date, market_data, positions, snapshot, regime, cash, total_value,
+        )
+
+        return {
+            "schema_version": "1.0",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "account": account_name,
+            "date": date,
+            "rule_version": self.strategy_version,
+            "market_regime": regime,
+            "portfolio_snapshot": snapshot,
+            "actions": actions,
+            "blocked_actions": blocked,
+            "alerts": alerts,
+            "summary": self._build_summary(actions),
+        }
+
+    def _compute_market_regime(self, market_data):
+        """Filled in Task 4."""
+        return {
+            "label": "unknown",
+            "hs300_5d_return": 0.0,
+            "hs300_20d_return": 0.0,
+            "position_cap": 0.85,
+            "single_cap": 0.25,
+            "stop_loss_threshold": -0.12,
+        }
+
+    def _compute_portfolio_snapshot(self, positions, market_data, cash, total_value):
+        """Filled in Task 5."""
+        return {
+            "total_value": total_value,
+            "cash": cash,
+            "cash_pct": cash / total_value if total_value else 0.0,
+            "position_value": total_value - cash,
+            "position_pct": (total_value - cash) / total_value if total_value else 0.0,
+            "sectors": {},
+            "by_position": [],
+        }
+
+    def _evaluate_rules(self, date, market_data, positions, snapshot,
+                        regime, cash, total_value):
+        """Filled in Tasks 6-11. Returns (actions, blocked_actions, alerts)."""
+        return [], [], []
+
+    def _build_summary(self, actions):
+        counts = {"buy": 0, "sell": 0, "hold": 0, "watch": 0}
+        for a in actions:
+            counts[a["action"]] = counts.get(a["action"], 0) + 1
+        highest = None
+        for a in actions:
+            conf = a.get("confidence")
+            if conf is None:
+                continue
+            if highest is None or conf > highest["confidence"]:
+                highest = {
+                    "code": a["code"], "action": a["action"], "confidence": conf,
+                }
+        return {
+            "action_count": counts,
+            "highest_confidence_action": highest,
+        }
+
+    # ==================== 旧 helper（保留供回测兼容）====================
 
     def check_buy_preconditions(self, code, name, date, market_data, positions, total_value, cash):
         """
