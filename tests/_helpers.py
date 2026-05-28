@@ -21,15 +21,29 @@ def load_rules():
 
 
 def make_in_memory_db():
-    """In-memory SQLite Database with schema initialized."""
+    """In-memory SQLite Database with schema initialized.
+
+    Suppresses init_tables / create_account stdout to keep test output clean.
+    """
+    import io
+    import contextlib
     from db import Database
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     db = Database.__new__(Database)
     db.db_path = ":memory:"
     db.conn = conn
-    db.init_tables()
+    with contextlib.redirect_stdout(io.StringIO()):
+        db.init_tables()
     return db
+
+
+def add_test_account(db, name="test", account_type="main", budget=10000.0):
+    """Create an account on the in-memory db, silently. Returns account_id."""
+    import io
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        return db.create_account(name=name, type_=account_type, budget=budget)
 
 
 def make_market_data(**overrides):
