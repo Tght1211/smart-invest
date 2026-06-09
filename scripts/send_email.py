@@ -139,7 +139,7 @@ def markdown_to_html(md_text):
                     lbl = block_lines[0] if block_lines else ""
                     num = block_lines[1] if len(block_lines) > 1 else ""
                     neg = num.lstrip().startswith("-")
-                    nc = UP if neg else DN
+                    nc = DN if neg else UP   # 红涨绿跌：盈利(正)→红，亏损(负)→绿
                     parts.append(
                         f'<table width="100%" cellpadding="0" cellspacing="0">'
                         f'<tr><td style="padding:32px 20px 24px;text-align:center;'

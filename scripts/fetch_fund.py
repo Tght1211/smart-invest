@@ -43,6 +43,19 @@ INDICES = {
     "上证50": "1.000016",
 }
 
+# 美股指数 secid（eastmoney 美股行情）。QDII 基金当日净值方向 ≈ 对应美股指数隔夜涨跌，
+# 美股北京时间约 21:30–次日 04:00 交易，故凌晨即可大致判断当日 QDII 结算涨跌。
+US_INDICES = {
+    "纳斯达克100": "100.NDX",
+    "标普500": "100.SPX",
+    "道琼斯": "100.DJIA",
+}
+
+# QDII 基金 → 参考美股指数（看该指数隔夜涨跌判断基金当日方向）
+QDII_INDEX_MAP = {
+    "006479": "纳斯达克100",   # 广发纳斯达克100ETF联接C → NDX
+}
+
 
 def _get(url, headers=None, retries=2):
     """通用 HTTP GET 请求，带重试"""
@@ -106,6 +119,104 @@ def cmd_indices(args):
         sign = "+" if pct >= 0 else ""
         print(f"{name:<10} {price:>10.2f} {sign}{pct:>6.2f}% {sign}{change:>9.2f} {vol_yi:>11.1f}")
     print("=" * 70)
+
+
+def _parse_us_index(data, fallback_name):
+    """从 eastmoney ulist 响应里解出美股指数 {name, price, pct}。纯函数，便于测试。"""
+    items = (data or {}).get("data", {}).get("diff") or []
+    if not items:
+        return None
+    it = items[0]
+    return {
+        "name": it.get("f14") or fallback_name,
+        "price": it.get("f2"),
+        "pct": it.get("f3"),
+    }
+
+
+def fetch_us_index(name="纳斯达克100"):
+    """抓美股指数实时/隔夜行情，返回 {name, price, pct} 或 None。
+    用于 QDII 基金（如 006479）的当日方向判断 —— 看 NDX 隔夜涨跌。"""
+    secid = US_INDICES.get(name)
+    if not secid:
+        return None
+    url = (
+        "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+        "fltt=2&invt=2&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        f"&fields=f2,f3,f4,f12,f14&secids={secid}"
+    )
+    text = _get(url)
+    if not text:
+        return None
+    try:
+        return _parse_us_index(json.loads(text), name)
+    except Exception:
+        return None
+
+
+def qdii_overnight_signal(code):
+    """给定 QDII 基金代码，返回其参考美股指数的隔夜涨跌 dict（含 fund_code/index_name），
+    无映射或抓取失败返回 None。供开盘/盘尾分析判断 006479 等当日方向。"""
+    idx_name = QDII_INDEX_MAP.get(code)
+    if not idx_name:
+        return None
+    res = fetch_us_index(idx_name)
+    if not res:
+        return None
+    res["fund_code"] = code
+    res["index_name"] = idx_name
+    return res
+
+
+def fetch_indices():
+    """返回大盘指数 [{name, pct, price}]，供卡片热力块。失败返回 []。"""
+    url = (
+        "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+        "fltt=2&invt=2&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        f"&fields=f2,f3,f12,f14&secids={','.join(INDICES.values())}"
+    )
+    text = _get(url)
+    if not text:
+        return []
+    try:
+        items = json.loads(text).get("data", {}).get("diff") or []
+    except Exception:
+        return []
+    return [
+        {"name": it.get("f14", ""), "pct": it.get("f3"), "price": it.get("f2")}
+        for it in items
+    ]
+
+
+def fetch_sectors(top_n=5):
+    """返回涨幅前 top_n 行业板块 [{name, pct}]，供卡片热力块。失败返回 []。"""
+    url = (
+        "https://push2.eastmoney.com/api/qt/clist/get?"
+        "pn=1&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2&fields=f3,f14"
+    )
+    text = _get(url)
+    if not text:
+        return []
+    try:
+        items = json.loads(text).get("data", {}).get("diff") or []
+    except Exception:
+        return []
+    items = [it for it in items if it.get("f3") is not None]
+    items.sort(key=lambda x: x["f3"], reverse=True)
+    return [{"name": it.get("f14", ""), "pct": it.get("f3")} for it in items[:top_n]]
+
+
+def cmd_us_index(args):
+    """打印美股指数隔夜行情（QDII 方向判断）。"""
+    name = args.name
+    res = fetch_us_index(name)
+    if not res or res.get("pct") is None:
+        print(f"获取美股指数失败: {name}（secid={US_INDICES.get(name, '?')}，请在联网环境核对）")
+        return
+    pct = res["pct"]
+    sign = "+" if pct >= 0 else ""
+    arrow = "📈涨" if pct > 0 else ("📉跌" if pct < 0 else "持平")
+    print(f"{res['name']}  {res['price']}  {sign}{pct}%  → 对应 QDII 今日预计{arrow}")
 
 
 def cmd_sectors(args):
@@ -762,6 +873,11 @@ def main():
     # sectors
     sub.add_parser("sectors", help="获取行业板块涨跌排行")
 
+    # us-index — 美股指数隔夜行情（QDII 方向判断）
+    p_us = sub.add_parser("us-index", help="美股指数隔夜行情（QDII 方向，如纳斯达克100）")
+    p_us.add_argument("name", nargs="?", default="纳斯达克100",
+                      help="指数名：纳斯达克100/标普500/道琼斯（默认纳斯达克100）")
+
     # estimate
     p_est = sub.add_parser("estimate", help="获取单只基金实时估值")
     p_est.add_argument("code", help="基金代码，如 110011")
@@ -814,6 +930,7 @@ def main():
     cmd_map = {
         "indices": cmd_indices,
         "sectors": cmd_sectors,
+        "us-index": cmd_us_index,
         "estimate": cmd_estimate,
         "nav": cmd_nav,
         "rank": cmd_rank,
