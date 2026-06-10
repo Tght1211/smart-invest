@@ -106,6 +106,33 @@ def _short_name(name):
 
 # ---------- 卡片各段 ----------
 
+def spark_lines(label, pre_close, values):
+    """:::spark DSL 行。纯函数：label + 昨收 + 价格序列 → 卡片 markdown 行。"""
+    if not values or len(values) < 2:
+        return []
+    last = values[-1]
+    if pre_close:
+        pct = (last - pre_close) / pre_close * 100
+    else:
+        pct = (last - values[0]) / values[0] * 100 if values[0] else 0.0
+    sign = "+" if pct >= 0 else ""
+    csv = ",".join(f"{v:.2f}" for v in values)
+    return [":::spark", f"{label} | {last:,.2f} {sign}{pct:.2f}%", csv, ":::", ""]
+
+
+def card_spark(ctx):
+    """纳指100 隔夜分时 sparkline（QDII 持仓方向参考）。网络失败静默跳过。"""
+    try:
+        trend = fetch_fund.fetch_index_trend("100.NDX", ndays=1)
+        if not trend or len(trend["points"]) < 10:
+            return []
+        import chart as chart_mod
+        vals = chart_mod.downsample([p[1] for p in trend["points"]], 70)
+        return spark_lines("纳指100 隔夜走势（006479 方向）", trend.get("pre_close"), vals)
+    except Exception:
+        return []
+
+
 def card_top(ctx, session):
     sess = SESSIONS[session]
     funds, positions = ctx["funds"], ctx["positions"]
@@ -315,6 +342,7 @@ def _notify(account, action, code, name, amt, nav, shares, note):
 def assemble(db, ctx, session, recorded, skipped=None):
     md = []
     md += card_top(ctx, session)
+    md += card_spark(ctx)
     md += card_action(ctx, session, recorded, skipped)
     md += card_holdings(ctx)
     md += card_blocks()

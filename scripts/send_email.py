@@ -168,6 +168,40 @@ def markdown_to_html(md_text):
                         f'<tr><td style="height:8px;background-color:#F5F5F5;"></td></tr>'
                         f'</table>'
                     )
+                elif block_type == "spark":
+                    # 行1: "标题 | 右侧数值"；行2: 逗号分隔的价格序列
+                    _sdir = str(Path(__file__).resolve().parent)
+                    if _sdir not in sys.path:
+                        sys.path.insert(0, _sdir)
+                    import chart as _chart
+                    head = block_lines[0] if block_lines else ""
+                    segs = [x.strip() for x in head.split("|")]
+                    label = segs[0] if segs else ""
+                    right = segs[1] if len(segs) > 1 else ""
+                    try:
+                        vals = [float(x) for x in
+                                (block_lines[1] if len(block_lines) > 1 else "").split(",") if x.strip()]
+                    except ValueError:
+                        vals = []
+                    rc = DN if right.rstrip("%").split()[-1].startswith("-") else UP
+                    parts.append(
+                        '<table width="100%" cellpadding="0" cellspacing="0">'
+                        '<tr><td style="padding:14px 20px 12px;background-color:#ffffff;">'
+                        '<table width="100%" cellpadding="0" cellspacing="0"><tr>'
+                        f'<td style="font-size:13px;color:{GRAY};">{_md(label)}</td>'
+                        f'<td style="font-size:13px;font-weight:700;color:{rc};'
+                        f'text-align:right;white-space:nowrap;">{_md(right)}</td>'
+                        '</tr></table>'
+                    )
+                    if len(vals) >= 2:
+                        parts.append(
+                            f'<div style="margin-top:8px;">{_chart.spark_html(vals)}</div>'
+                        )
+                    parts.append(
+                        '</td></tr>'
+                        '<tr><td style="height:8px;background-color:#F5F5F5;"></td></tr>'
+                        '</table>'
+                    )
                 elif block_type == "blocks":
                     import re as _re
                     items = []

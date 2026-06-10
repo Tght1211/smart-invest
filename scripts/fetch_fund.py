@@ -72,6 +72,15 @@ def _get(url, headers=None, retries=2):
                 import time
                 time.sleep(0.5)
                 continue
+            # 东财 CDN 偶发掐 Python 的 https 连接（TLS 指纹），公开行情接口可降级 http 再试一次
+            if url.startswith("https://"):
+                try:
+                    req = urllib.request.Request(
+                        "http://" + url[len("https://"):], headers=req_headers)
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        return resp.read().decode("utf-8")
+                except Exception:
+                    pass
             print(f"[ERROR] 请求失败: {url}\n  {e}", file=sys.stderr)
             return None
 
@@ -166,6 +175,122 @@ def qdii_overnight_signal(code):
     res["fund_code"] = code
     res["index_name"] = idx_name
     return res
+
+
+def _parse_trend(data):
+    """解析 eastmoney trends2 分时响应 → {name, pre_close, points:[(time, price)]}。
+    纯函数，便于测试。空数据返回 None。"""
+    d = (data or {}).get("data")
+    if not d or not d.get("trends"):
+        return None
+    points = []
+    for row in d["trends"]:
+        segs = row.split(",")
+        if len(segs) >= 2:
+            points.append((segs[0], float(segs[1])))
+    return {"name": d.get("name", ""), "pre_close": d.get("preClose"), "points": points}
+
+
+def fetch_index_trend(secid, ndays=1):
+    """抓指数分时（A股或美股 secid 通用），失败返回 None。"""
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/trends2/get?"
+        f"secid={secid}&fields1=f1,f2,f3,f7,f8&fields2=f51,f53&iscr=0&ndays={ndays}"
+    )
+    text = _get(url)
+    if not text:
+        return None
+    try:
+        return _parse_trend(json.loads(text))
+    except Exception:
+        return None
+
+
+_US_ALIASES = {"NDX": "纳斯达克100", "SPX": "标普500", "DJIA": "道琼斯"}
+
+
+def _resolve_chart_target(target):
+    """chart 子命令目标解析：指数名/美股别名/6位基金代码。
+    返回 ("index", secid, name) | ("fund", code, None) | None。纯函数。"""
+    t = target.strip()
+    alias = _US_ALIASES.get(t.upper())
+    if alias:
+        return ("index", US_INDICES[alias], alias)
+    if t in US_INDICES:
+        return ("index", US_INDICES[t], t)
+    if t in INDICES:
+        return ("index", INDICES[t], t)
+    if t.isdigit() and len(t) == 6:
+        return ("fund", t, None)
+    return None
+
+
+def fetch_nav_series(code, days=60):
+    """基金历史净值（升序时间）→ [(date, nav)]，失败返回 []。"""
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+    url = (
+        f"https://api.fund.eastmoney.com/f10/lsjz?"
+        f"fundCode={code}&pageIndex=1&pageSize={days}"
+        f"&startDate={start_date}&endDate={end_date}"
+    )
+    text = _get(url)
+    if not text:
+        return []
+    try:
+        nav_list = json.loads(text).get("Data", {}).get("LSJZList", [])
+    except Exception:
+        return []
+    out = []
+    for item in nav_list:
+        try:
+            out.append((item.get("FSRQ", ""), float(item.get("DWJZ"))))
+        except (TypeError, ValueError):
+            continue
+    out.reverse()  # 接口倒序 → 升序
+    return out
+
+
+def cmd_chart(args):
+    """终端走势图：指数分时 / 基金净值曲线。"""
+    import chart as chart_mod
+
+    resolved = _resolve_chart_target(args.target)
+    if not resolved:
+        print(f"不认识的目标: {args.target}（支持指数名如 纳斯达克100/沪深300、别名 NDX/SPX/DJIA、6位基金代码）")
+        return
+    kind, key, name = resolved
+    height, width = args.height, args.width
+
+    if kind == "index":
+        trend = fetch_index_trend(key, ndays=args.ndays)
+        if not trend or len(trend["points"]) < 2:
+            print(f"获取 {name} 分时数据失败")
+            return
+        prices = [p[1] for p in trend["points"]]
+        times = [p[0][11:16] for p in trend["points"]]
+        pre = trend.get("pre_close")
+        last = prices[-1]
+        chg = (last - pre) / pre * 100 if pre else 0.0
+        sign = "+" if chg >= 0 else ""
+        print(f"\n  {trend['name'] or name}  {last:,.2f}  {sign}{chg:.2f}%   "
+              f"(昨收 {pre:,.2f} | 高 {max(prices):,.2f} | 低 {min(prices):,.2f})\n")
+        print(chart_mod.render_chart(prices, height=height, width=width))
+        print(chart_mod.axis_line([times[0], times[len(times) // 2], times[-1]], width, 12))
+    else:
+        series = fetch_nav_series(key, days=args.days)
+        if len(series) < 2:
+            print(f"获取基金 {key} 净值数据失败")
+            return
+        navs = [nav for _, nav in series]
+        dates = [d for d, _ in series]
+        chg = (navs[-1] - navs[0]) / navs[0] * 100 if navs[0] else 0.0
+        sign = "+" if chg >= 0 else ""
+        print(f"\n  基金 {key} 近 {len(navs)} 个交易日净值  最新 {navs[-1]:.4f}  "
+              f"区间 {sign}{chg:.2f}%\n")
+        print(chart_mod.render_chart(navs, height=height, width=width,
+                                     label_fmt="{:>10.4f}"))
+        print(chart_mod.axis_line([dates[0], dates[len(dates) // 2], dates[-1]], width, 12))
 
 
 def fetch_indices():
@@ -878,6 +1003,14 @@ def main():
     p_us.add_argument("name", nargs="?", default="纳斯达克100",
                       help="指数名：纳斯达克100/标普500/道琼斯（默认纳斯达克100）")
 
+    # chart — 终端走势图
+    p_chart = sub.add_parser("chart", help="终端走势图（指数分时/基金净值曲线）")
+    p_chart.add_argument("target", help="指数名(纳斯达克100/沪深300…)、别名(NDX/SPX/DJIA) 或 6位基金代码")
+    p_chart.add_argument("--days", type=int, default=60, help="基金净值回看天数（默认60）")
+    p_chart.add_argument("--ndays", type=int, default=1, help="指数分时天数（默认1）")
+    p_chart.add_argument("--height", type=int, default=14, help="图高（默认14行）")
+    p_chart.add_argument("--width", type=int, default=90, help="图宽（默认90列）")
+
     # estimate
     p_est = sub.add_parser("estimate", help="获取单只基金实时估值")
     p_est.add_argument("code", help="基金代码，如 110011")
@@ -931,6 +1064,7 @@ def main():
         "indices": cmd_indices,
         "sectors": cmd_sectors,
         "us-index": cmd_us_index,
+        "chart": cmd_chart,
         "estimate": cmd_estimate,
         "nav": cmd_nav,
         "rank": cmd_rank,

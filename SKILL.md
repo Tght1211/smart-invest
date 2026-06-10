@@ -242,7 +242,7 @@ python3 scripts/send_email.py trade-notify \
 
 ### 5.1 卡片 DSL 速查（所有定时报告都用这套，渲染成卡片邮件）
 
-`send_email.py` 的渲染器认识下面 5 种块，把 markdown 渲染成移动端卡片邮件。**报告正文必须用这套 DSL 写，不要用普通 `##` 标题**（普通标题只会渲染成朴素样式，不是卡片）。
+`send_email.py` 的渲染器认识下面 6 种块，把 markdown 渲染成移动端卡片邮件。**报告正文必须用这套 DSL 写，不要用普通 `##` 标题**（普通标题只会渲染成朴素样式，不是卡片）。
 
 **① 顶部大数字 `:::card`** — 三行：标签 / 大数字 / stats（`|` 分隔）
 
@@ -289,6 +289,15 @@ python3 scripts/send_email.py trade-notify \
 :::
 ```
 
+**⑥ 迷你走势图 `:::spark`** — 行1"标题 | 最新价 涨跌%"，行2 逗号分隔的价格序列，渲染成红涨绿跌的迷你柱状走势（开盘卡片用它放 NDX 隔夜分时）。`daily_report.py` 的 `card_spark()` 自动生成，手动组卡片可用 `daily_report.spark_lines()`
+
+```
+:::spark
+纳指100 隔夜走势（006479 方向） | 25,678.82 -0.97%
+26110.31,26153.59,...,25678.82
+:::
+```
+
 `### 标题` 渲染成灰色分组小标题（用来分隔"我的持仓"/"大盘行情"/"近期操作"）。
 
 **数据接线**（组装卡片时各槽位取哪里的数据）：
@@ -330,7 +339,12 @@ python3 scripts/daily_report.py --session open|mid|close --account 主线
 
 ```bash
 python3 scripts/fetch_fund.py us-index 纳斯达克100    # NDX 隔夜涨跌 → 006479 今日预计涨/跌
+python3 scripts/fetch_fund.py chart NDX              # 终端画 NDX 隔夜分时走势图（别名 NDX/SPX/DJIA）
+python3 scripts/fetch_fund.py chart 沪深300           # A 股指数分时
+python3 scripts/fetch_fund.py chart 006479 --days 60  # 基金净值曲线（任意 6 位代码）
 ```
+
+用户在终端问"画一下走势/看看波动"时，直接跑 `chart` 子命令把字符走势图贴给他。
 
 开盘卡片(09:30)里 006479 的预判直接引用 NDX 隔夜结果。又因 QDII **限购 ¥10/天**（且用户已定投 ¥10/天），引擎对 006479 **不再给加仓指令**，能执行的只有卖出侧（止盈/止损，限购不影响卖出）——卖不卖看 NDX：涨多了锁利、跌势确立止损。
 
