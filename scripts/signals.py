@@ -114,6 +114,44 @@ def compute_breakout(navs: List[float], lookback: int = 20) -> Optional[bool]:
     return latest > max(prior_window)
 
 
+def compute_ma_state(
+    closes: List[float], window: int = 200, buffer: float = 0.01,
+) -> Optional[dict]:
+    """长均线趋势状态（Faber 200日线过滤，P5）。
+
+    Returns {ma, gap_pct, below_days, above} or None if fewer than `window` closes.
+    - gap_pct: (最新收盘 - MA) / MA
+    - below_days: 连续多少天收盘 < 当日MA*(1-buffer)（从最新往回数）
+    - above: 最新收盘 >= 当日 MA
+    """
+    n = len(closes)
+    if n < window:
+        return None
+    # 滚动 MA（只算能算的尾部区间，避免 O(n*window)）
+    ma_series = []
+    s = sum(closes[:window])
+    ma_series.append(s / window)
+    for i in range(window, n):
+        s += closes[i] - closes[i - window]
+        ma_series.append(s / window)
+    # ma_series[j] 对应 closes[window-1+j]
+    last_ma = ma_series[-1]
+    last = closes[-1]
+    below_days = 0
+    for j in range(len(ma_series) - 1, -1, -1):
+        c = closes[window - 1 + j]
+        if c < ma_series[j] * (1 - buffer):
+            below_days += 1
+        else:
+            break
+    return {
+        "ma": round(last_ma, 6),
+        "gap_pct": round((last - last_ma) / last_ma, 6) if last_ma else 0.0,
+        "below_days": below_days,
+        "above": last >= last_ma,
+    }
+
+
 def attach_signals(navs: List[float]) -> dict:
     """Convenience wrapper — returns a dict of all signals (with None for insufficient data)."""
     return {

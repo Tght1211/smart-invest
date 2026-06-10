@@ -1,15 +1,15 @@
 {
-  "version": "v2.0",
-  "parent": "v1.0",
-  "changelog": "加入赛道集中度控制、大盘环境判断、分档止损止盈、低吸策略",
-  "reason": "v1.0缺乏风险控制，容易追高、集中持仓，导致大幅回撤",
-  "created_at": "2026-05-26",
-  "created_by": "ai",
+  "version": "v2.1",
+  "parent": "v2.0",
+  "changelog": "采纳梦境实验室变体 let-winners-run: 关闭分层止盈 + 趋势退出兜底（线上 LET_WINNERS_RUN 形态）",
+  "reason": "回测 2025-06-10~2026-06-09 得分 69.361（年化 +74.80%, 回撤 -10.89%）",
+  "created_at": "2026-06-10",
+  "created_by": "strategy_lab",
   "rules": {
     "buy_preconditions": {
-      "min_cash_ratio": 0.10,
+      "min_cash_ratio": 0.1,
       "max_single_weight": 0.25,
-      "max_chase_return_5d": 0.10,
+      "max_chase_return_5d": 0.1,
       "max_consecutive_drops": 5,
       "market_check": {
         "hs300_5d_drop_limit": -0.05,
@@ -31,29 +31,76 @@
       ]
     },
     "sector_limits": {
-      "科技/AI": 0.50,
-      "消费": 0.30,
-      "新能源": 0.30,
-      "金融": 0.20,
-      "资源": 0.20,
-      "宽基指数": 0.30,
-      "海外": 0.40
+      "科技/AI": 0.5,
+      "消费": 0.3,
+      "新能源": 0.3,
+      "金融": 0.2,
+      "资源": 0.2,
+      "宽基指数": 0.3,
+      "海外": 0.4
     },
     "sector_keywords": {
-      "科技/AI": ["半导体", "芯片", "人工智能", "信息科技", "数字经济", "通信", "5G", "AI", "软件", "计算机"],
-      "消费": ["白酒", "食品", "医药", "消费", "医疗", "生物"],
-      "新能源": ["光伏", "锂电", "新能源车", "清洁能源", "风电"],
-      "金融": ["银行", "券商", "保险", "证券"],
-      "资源": ["黄金", "有色金属", "煤炭", "石油", "钢铁"],
-      "宽基指数": ["沪深300", "中证500", "创业板指", "上证50", "中证1000"],
-      "海外": ["纳斯达克", "标普500", "港股", "美国", "全球"]
+      "科技/AI": [
+        "半导体",
+        "芯片",
+        "人工智能",
+        "信息科技",
+        "数字经济",
+        "通信",
+        "5G",
+        "AI",
+        "软件",
+        "计算机"
+      ],
+      "消费": [
+        "白酒",
+        "食品",
+        "医药",
+        "消费",
+        "医疗",
+        "生物"
+      ],
+      "新能源": [
+        "光伏",
+        "锂电",
+        "新能源车",
+        "清洁能源",
+        "风电"
+      ],
+      "金融": [
+        "银行",
+        "券商",
+        "保险",
+        "证券"
+      ],
+      "资源": [
+        "黄金",
+        "有色金属",
+        "煤炭",
+        "石油",
+        "钢铁"
+      ],
+      "宽基指数": [
+        "沪深300",
+        "中证500",
+        "创业板指",
+        "上证50",
+        "中证1000"
+      ],
+      "海外": [
+        "纳斯达克",
+        "标普500",
+        "港股",
+        "美国",
+        "全球"
+      ]
     },
     "market_regimes": {
       "bull": {
         "name": "牛市",
         "condition": "沪深300近20天涨幅 > 5%",
         "max_position": 0.95,
-        "max_single": 0.30,
+        "max_single": 0.3,
         "chase_limit_5d": 0.15,
         "stop_loss_adjustment": -0.15
       },
@@ -62,13 +109,13 @@
         "condition": "沪深300近20天波动 -5% ~ +5%",
         "max_position": 0.85,
         "max_single": 0.25,
-        "chase_limit_5d": 0.10,
+        "chase_limit_5d": 0.1,
         "stop_loss_adjustment": -0.12
       },
       "bear": {
         "name": "熊市",
         "condition": "沪深300近20天跌幅 > 10%",
-        "max_position": 0.60,
+        "max_position": 0.6,
         "max_single": 0.15,
         "chase_limit_5d": 0.05,
         "stop_loss_adjustment": -0.08,
@@ -82,7 +129,7 @@
         "priority": 1,
         "conditions": {
           "single_day_drop": -0.07,
-          "three_day_drop": -0.10
+          "three_day_drop": -0.1
         },
         "action": "sell_50%",
         "description": "单日跌幅 > 7% 或 连续3天累计跌幅 > 10%"
@@ -133,7 +180,7 @@
         "name": "绝对止损",
         "priority": 0,
         "conditions": {
-          "loss_pct": -0.20
+          "loss_pct": -0.2
         },
         "action": "sell_100%",
         "description": "任何情况亏损 > 20% 清仓"
@@ -141,27 +188,27 @@
     ],
     "take_profit": [
       {
-        "level": 0.20,
+        "level": 0.2,
         "action": "sell_25%",
         "cumulative": 0.25,
         "description": "盈利 +20% 卖出 25%"
       },
       {
-        "level": 0.30,
+        "level": 0.3,
         "action": "sell_25%",
-        "cumulative": 0.50,
+        "cumulative": 0.5,
         "description": "盈利 +30% 再卖出 25%（累计50%）"
       },
       {
-        "level": 0.40,
+        "level": 0.4,
         "action": "sell_25%",
         "cumulative": 0.75,
         "description": "盈利 +40% 再卖出 25%（累计75%）"
       },
       {
-        "level": 0.50,
+        "level": 0.5,
         "action": "sell_100%",
-        "cumulative": 1.00,
+        "cumulative": 1.0,
         "description": "盈利 +50% 清仓"
       }
     ],
@@ -181,8 +228,8 @@
         "over": 1.3
       },
       "cash_range": {
-        "min": 0.10,
-        "max": 0.30
+        "min": 0.1,
+        "max": 0.3
       }
     },
     "low_buy": {
@@ -192,7 +239,7 @@
         "target_5d_return_max": 0.05,
         "target_day_drop_min": -0.03,
         "cash_ratio_min": 0.15,
-        "single_weight_max": 0.20
+        "single_weight_max": 0.2
       },
       "amount": {
         "base_ratio": 0.03,
@@ -209,21 +256,21 @@
       "initial_budget_allocation": [
         {
           "batch": 1,
-          "ratio": 0.40,
+          "ratio": 0.4,
           "fund_count": "3-4",
-          "per_fund": 0.10,
-          "cash_reserve": 0.40
+          "per_fund": 0.1,
+          "cash_reserve": 0.4
         },
         {
           "batch": 2,
-          "ratio": 0.30,
+          "ratio": 0.3,
           "timing": "观察1周后",
           "action": "加仓表现好的基金或新建仓",
-          "cash_reserve": 0.10
+          "cash_reserve": 0.1
         },
         {
           "batch": 3,
-          "ratio": 0.30,
+          "ratio": 0.3,
           "action": "等待回调机会，对核心持仓加仓",
           "cash_reserve": "0.10-0.20"
         }
@@ -272,23 +319,103 @@
       "建仓规则"
     ],
     "rules_meta": {
-      "cash_reserve":              {"severity": "block", "enabled": true, "zh": "现金储备 ≥ 10%"},
-      "single_position":           {"severity": "block", "enabled": true, "zh": "单只仓位 ≤ 25%"},
-      "sector_concentration":      {"severity": "block", "enabled": true, "zh": "赛道集中度上限"},
-      "anti_chase":                {"severity": "block", "enabled": true, "zh": "禁止追涨 5 日 > 10%"},
-      "bear_market_new_position":  {"severity": "block", "enabled": true, "zh": "熊市禁止新建仓"},
-      "market_regime_unknown":     {"severity": "block", "enabled": true, "zh": "大盘数据缺失暂停建仓"},
-      "low_buy":                   {"severity": "info",  "enabled": true, "zh": "当日跌 > 3% 低吸"},
-      "emergency_stop_loss":       {"severity": "warn",  "enabled": true, "zh": "单日 > 7% 或 3 日 > 10% 紧急止损"},
-      "absolute_stop_loss":        {"severity": "warn",  "enabled": true, "zh": "亏损 > 20% 强制清仓"},
-      "time_based_stop_loss":      {"severity": "warn",  "enabled": true, "zh": "按持有期分档止损"},
-      "take_profit_tier_20":       {"severity": "info",  "enabled": true, "zh": "+20% 减仓 25%"},
-      "take_profit_tier_30":       {"severity": "info",  "enabled": true, "zh": "+30% 再减 25%"},
-      "take_profit_tier_40":       {"severity": "info",  "enabled": true, "zh": "+40% 再减 25%"},
-      "take_profit_clearout":      {"severity": "info",  "enabled": true, "zh": "+50% 清仓锁利"},
-      "drawdown_protection":       {"severity": "warn",  "enabled": true, "zh": "组合回撤 ≥ 10% 暂缓买入"},
-      "low_buy_deferred_drawdown": {"severity": "info",  "enabled": true, "zh": "回撤保护下低吸降级为观察"},
-      "data_missing":              {"severity": "warn",  "enabled": true, "zh": "无法获取基金数据，跳过决策"}
+      "cash_reserve": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "现金储备 ≥ 10%"
+      },
+      "single_position": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "单只仓位 ≤ 25%"
+      },
+      "sector_concentration": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "赛道集中度上限"
+      },
+      "anti_chase": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "禁止追涨 5 日 > 10%"
+      },
+      "bear_market_new_position": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "熊市禁止新建仓"
+      },
+      "market_regime_unknown": {
+        "severity": "block",
+        "enabled": true,
+        "zh": "大盘数据缺失暂停建仓"
+      },
+      "low_buy": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "当日跌 > 3% 低吸"
+      },
+      "emergency_stop_loss": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "单日 > 7% 或 3 日 > 10% 紧急止损"
+      },
+      "absolute_stop_loss": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "亏损 > 20% 强制清仓"
+      },
+      "time_based_stop_loss": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "按持有期分档止损"
+      },
+      "take_profit_tier_20": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "+20% 减仓 25%"
+      },
+      "take_profit_tier_30": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "+30% 再减 25%"
+      },
+      "take_profit_tier_40": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "+40% 再减 25%"
+      },
+      "take_profit_clearout": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "+50% 清仓锁利"
+      },
+      "drawdown_protection": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "组合回撤 ≥ 10% 暂缓买入"
+      },
+      "low_buy_deferred_drawdown": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "回撤保护下低吸降级为观察"
+      },
+      "data_missing": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "无法获取基金数据，跳过决策"
+      }
+    },
+    "take_profit_policy": {
+      "mode": "off"
+    },
+    "trend_exit": {
+      "enabled": true,
+      "confirm_days": 2,
+      "sell_fraction": 0.5
+    },
+    "trend_filter": {
+      "enabled": true,
+      "low_buy_factor": 0.5
     }
   }
 }

@@ -21,11 +21,21 @@ class DecisionEngine:
     def __init__(self, db, account_id, strategy_version=None, rules_override=None):
         self.db = db
         self.account_id = account_id
-        self.strategy_version = strategy_version or "v2.0"
+        self.strategy_version = strategy_version or self._live_tree_version()
         if rules_override is not None:
             self.rules = rules_override
         else:
             self.rules = self._load_rules()
+
+    @staticmethod
+    def _live_tree_version():
+        """默认策略版本 = data/decision_tree.json 的 version 字段。
+        strategy_lab --promote 更新该文件后，decide.py/daily_report 自动跟进新版。"""
+        try:
+            with open(DATA_DIR / "decision_tree.json", "r", encoding="utf-8") as f:
+                return json.load(f).get("version") or "v2.0"
+        except Exception:
+            return "v2.0"
 
     def _load_rules(self):
         """加载决策树规则"""
@@ -114,6 +124,8 @@ class DecisionEngine:
             "position_cap": pcap,
             "single_cap": scap,
             "stop_loss_threshold": sl,
+            # P5 趋势过滤：HS300 200日线状态（数据层缺失时为 None，规则自动跳过）
+            "hs300_trend": (market_data.get("index_trend") or {}).get("HS300"),
         }
 
     def _compute_portfolio_snapshot(self, positions, market_data, cash, total_value):
@@ -241,6 +253,14 @@ class DecisionEngine:
         if regime["label"] == "熊市" and existing:
             target_amount *= 0.5
 
+        # P5 趋势闸门（Faber 200日线）：HS300 在 200 日线下时低吸打折，"别接趋势破位的飞刀"
+        trend_gated = False
+        tf = self.rules.get("trend_filter") or {}
+        hs300_trend = regime.get("hs300_trend")
+        if tf.get("enabled") and hs300_trend and not hs300_trend.get("above", True):
+            target_amount *= tf.get("low_buy_factor", 0.5)
+            trend_gated = True
+
         sector = fund.get("sector") or "其他"
         checks_passed, checks_failed = [], []
         for ok, info in [
@@ -287,6 +307,8 @@ class DecisionEngine:
                 f"近 5 天跌 {abs(fund.get('fund_5d_return', 0.0)) * 100:.1f}%；"
                 f"大盘 {regime['label']}；现金 "
                 f"{snapshot['cash_pct'] * 100:.0f}% 在阈值内。"
+                + ("（HS300 处于200日线下方，趋势闸门已将金额打折）"
+                   if trend_gated else "")
             ),
         }, None
 
@@ -386,9 +408,69 @@ class DecisionEngine:
             )
         return None
 
+    # ---------- trend exit (P5, Faber 200日线破位) ----------
+
+    def _try_trend_exit(self, code, fund, position, index_trend):
+        """参考指数连续 confirm_days 天收盘破 200 日线（含 buffer）→ 减仓。
+
+        依据：Faber (2006) 10月线择时；QQQ 2000-2024 回测 200日线退出
+        回撤 28.6% vs 持有 83%。规则默认关闭（rules 无 trend_exit 即跳过），
+        由 strategy_lab 回测验证后在新决策树版本里启用。
+        """
+        cfg = self.rules.get("trend_exit") or {}
+        if not cfg.get("enabled"):
+            return None
+        ref = fund.get("ref_index") or "HS300"
+        trend = index_trend.get(ref) or fund.get("ref_index_trend")
+        if not trend:
+            return None
+        confirm_days = cfg.get("confirm_days", 2)
+        below_days = trend.get("below_days", 0)
+        if below_days < confirm_days:
+            return None
+        # 事件触发：只在跨越确认日当天减仓一次，破位持续期间不每天重复卖
+        # （第二回测窗口证据：状态触发在震荡市 whipsaw，258 笔交易亏掉 8 个点）
+        if below_days > confirm_days:
+            return None
+        fraction = cfg.get("sell_fraction", 0.5)
+        nav = fund.get("current_nav", position["cost_nav"])
+        profit_pct = (
+            (nav - position["cost_nav"]) / position["cost_nav"]
+            if position["cost_nav"] else 0.0
+        )
+        ctx = {
+            "ref_index": ref,
+            "below_days": trend.get("below_days"),
+            "gap_pct": trend.get("gap_pct"),
+            "profit_pct": profit_pct,
+        }
+        if fund.get("signals"):
+            ctx["signals"] = fund["signals"]
+        return {
+            "code": code,
+            "name": position.get("name") or fund.get("name", ""),
+            "action": "sell",
+            "rule_id": "trend_exit_ma200",
+            "rule_label": "趋势破位退出",
+            "confidence": None,
+            "suggested_amount": round(position["shares"] * fraction * nav, 2),
+            "suggested_shares": round(position["shares"] * fraction, 4),
+            "context": ctx,
+            "checks_passed": [],
+            "checks_failed": [],
+            "reason_zh": (
+                f"参考指数 {ref} 已连续 {trend.get('below_days')} 天收于 200 日线下方"
+                f"（偏离 {trend.get('gap_pct', 0) * 100:.1f}%），趋势破位，"
+                f"减仓 {fraction * 100:.0f}% 落袋。"
+            ),
+        }
+
     # ---------- take-profit tiers ----------
 
     def _try_take_profit(self, code, fund, position):
+        # P5: take_profit_policy.mode=off → 让利润奔跑（趋势退出/止损仍有效）
+        if (self.rules.get("take_profit_policy") or {}).get("mode") == "off":
+            return None
         nav = fund.get("current_nav", position["cost_nav"])
         profit_pct = (
             (nav - position["cost_nav"]) / position["cost_nav"]
@@ -505,6 +587,10 @@ class DecisionEngine:
                 })
                 continue
             sell = self._try_stop_loss(code, fund, pos, regime)
+            if not sell:
+                sell = self._try_trend_exit(
+                    code, fund, pos, market_data.get("index_trend") or {},
+                )
             if not sell:
                 sell = self._try_take_profit(code, fund, pos)
             if sell:

@@ -48,6 +48,11 @@ BENCHMARKS = {
     "1.000001": "上证指数",
 }
 
+# QDII 基金 → 参考指数（与 fetch_fund.QDII_INDEX_MAP 对应，trend_exit 用）
+QDII_REF_INDEX = {
+    "006479": "NDX",
+}
+
 # 赛道定义（用于集中度检查）
 SECTOR_KEYWORDS = {
     "科技": ["半导体", "芯片", "人工智能", "信息科技", "数字经济", "科技", "电子", "传媒"],
@@ -93,6 +98,15 @@ def _get(url, retries=3, wait=1.5):
             if attempt < retries:
                 time.sleep(wait * (attempt + 1))
                 continue
+            # 东财 CDN 偶发掐 Python 的 https（TLS 指纹），公开行情接口降级 http 再试
+            if url.startswith("https://"):
+                try:
+                    req = urllib.request.Request(
+                        "http://" + url[len("https://"):], headers=HEADERS)
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        return resp.read().decode("utf-8")
+                except Exception:
+                    pass
             return None
 
 
@@ -170,7 +184,7 @@ class Simulator:
     """历史回测模拟器"""
 
     def __init__(self, start_date, end_date, budget, funds=None, sim_id=None, verbose=True,
-                 db=None, strategy_version="v2.0", engine_mode=False):
+                 db=None, strategy_version="v2.0", engine_mode=False, rules_override=None):
         self.start_date = start_date
         self.end_date = end_date
         self.budget = budget
@@ -195,11 +209,16 @@ class Simulator:
         self.account_id = None
         self.strategy_version = strategy_version
         self.engine = None
+        self.rules_override = rules_override  # 梦境实验室：变体规则直接喂引擎
         if self.db and DB_AVAILABLE:
-            self.engine = DecisionEngine(self.db, 0, strategy_version)  # account_id later
+            self.engine = DecisionEngine(self.db, 0, strategy_version,
+                                         rules_override=rules_override)  # account_id later
 
     def load_data(self):
-        """加载所有历史数据"""
+        """加载所有历史数据（已被实验室预注入时跳过网络）"""
+        if self.fund_navs:
+            print("📡 使用预注入的历史数据（实验室模式）")
+            return
         print(f"📡 加载历史数据 ({self.start_date} ~ {self.end_date})...")
 
         # 加载基金净值
@@ -567,12 +586,32 @@ class Simulator:
                 "sector": sector,
             }
 
+        # P5 趋势状态：HS300/NDX 200日线（只用 ≤date 的收盘，无未来函数；
+        # 数据不足 200 天时为 None → 引擎自动跳过趋势规则）
+        index_trend = {}
+        try:
+            import signals as _signals
+            for secid, key in (("1.000300", "HS300"), ("100.NDX", "NDX")):
+                data = self.index_data.get(secid) or {}
+                closes = [data[d] for d in sorted(data) if d <= date]
+                if len(closes) >= 200:
+                    st = _signals.compute_ma_state(closes, window=200)
+                    if st:
+                        index_trend[key] = st
+        except ImportError:
+            pass
+        for code in funds:
+            ref = QDII_REF_INDEX.get(code)
+            if ref:
+                funds[code]["ref_index"] = ref
+
         return {
             "hs300_5d_return": hs300_5d,
             "hs300_20d_return": hs300_20d,
             "regime_hint": None,
             "funds": funds,
             "portfolio_peak_value": self.peak_value,
+            "index_trend": index_trend,
         }
 
     def _positions_for_engine(self, date):

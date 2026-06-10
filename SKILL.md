@@ -509,7 +509,28 @@ python3 scripts/simulate.py list
 python3 scripts/simulate.py report <sim_id>
 ```
 
-> 内部逻辑详见 `README_DB.md`。Phase 2 会把 `simulate.py` 改为复用 `decision_engine.decide()`，让回测与实盘共用同一套规则。
+> 内部逻辑详见 `README_DB.md`。`--engine` 旗标让回测复用 `decision_engine.decide()`，回测与实盘同一套规则。
+
+### 7.1 梦境实验室（策略进化闭环）
+
+`strategy_lab.py` 在**同一历史窗口**跑多个策略变体并排名，是"提出策略 → 梦境验证 → 择优晋升"的引擎：
+
+```bash
+python3 scripts/strategy_lab.py variants          # 看内置变体（基线/趋势退出/低吸闸门/关止盈…）
+python3 scripts/strategy_lab.py run \
+  --start 2025-06-10 --end 2026-06-09 --budget 20000 \
+  [--variants name1,name2] [--evolve] [--promote v2.1 [--promote-variant NAME]]
+```
+
+- `--evolve`：冠军≠基线时写 `strategy_evolutions`（进化审计）
+- `--promote vX.Y`：把冠军（或 `--promote-variant` 指定的变体）注册为新决策树版本，**同时改写 `data/decision_tree.json`**；引擎默认版本跟随该文件，`decide.py`/`daily_report.py` 下次运行即用新规则
+- 数据只拉一次注入复用；指数自动多回看 450 天供 200 日线计算；沪深300 拉不到会直接报错中止（趋势规则依赖它，缺数据的回测无意义）
+- **铁律**：改规则必须先过实验室——至少两个不同市况窗口（牛市 + 震荡/熊市）都不劣化才能晋升
+
+已沉淀的回测证据（2026-06-10，两窗口 2025-06~2026-06 牛市 / 2024-06~2025-06 震荡）：
+- **关闭分层止盈**（`take_profit_policy.mode=off`）：牛市 +73.98% vs 基线 +47.27%，震荡市基本打平 → 已采纳（让利润奔跑的引擎级形态）
+- **趋势退出**（`trend_exit`，参考指数连续 N 天破 200 日线减仓）：事件触发（只在跨越确认日当天卖一次），破位期间不重复卖——状态触发版在震荡市 whipsaw 亏 8 个点，已修正
+- **低吸趋势闸门**（`trend_filter`，HS300 在 200 日线下低吸打折）：牛市窗口 +2.8 个点改善
 
 ---
 

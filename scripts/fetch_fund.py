@@ -813,6 +813,39 @@ def _infer_sector(name):
     return "其他"
 
 
+def _index_closes(secid, days=320):
+    """指数日K收盘序列（升序），失败返回 []。供 200 日线状态计算。"""
+    try:
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y%m%d")
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            f"secid={secid}&fields1=f1,f2,f3"
+            "&fields2=f51,f53"
+            f"&klt=101&fqt=0&beg={start_date}&end={end_date}"
+        )
+        text = _get(url)
+        if not text:
+            return []
+        klines = json.loads(text).get("data", {}).get("klines", [])
+        return [float(k.split(",")[1]) for k in klines]
+    except Exception:
+        return []
+
+
+def gather_index_trend():
+    """实时 200日线趋势状态 {HS300, NDX}（P5 趋势规则数据源）。失败项缺省。"""
+    import signals as _signals
+    out = {}
+    for secid, key in (("1.000300", "HS300"), ("100.NDX", "NDX")):
+        closes = _index_closes(secid)
+        if len(closes) >= 200:
+            st = _signals.compute_ma_state(closes, window=200)
+            if st:
+                out[key] = st
+    return out
+
+
 def _hs300_returns():
     """Return (5d_return, 20d_return) for HS300. (None, None) on fetch failure."""
     try:
@@ -949,6 +982,12 @@ def gather_market_snapshot(account_name="主线", date=None):
             if snap:
                 funds[p["code"]] = snap
 
+        # P5 趋势状态：QDII 基金标记参考指数（trend_exit 用 NDX 而非 A 股）
+        index_trend = gather_index_trend()
+        for code in funds:
+            if code in QDII_INDEX_MAP:
+                funds[code]["ref_index"] = "NDX"
+
         # Watchlist: simulate.py's DEFAULT_FUNDS, if importable
         try:
             from simulate import DEFAULT_FUNDS  # type: ignore
@@ -978,6 +1017,7 @@ def gather_market_snapshot(account_name="主线", date=None):
             "regime_hint": None,
             "funds": funds,
             "portfolio_peak_value": peak,
+            "index_trend": index_trend,
         }
     finally:
         db.close()
