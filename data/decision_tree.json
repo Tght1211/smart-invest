@@ -1,9 +1,9 @@
 {
-  "version": "v2.1",
-  "parent": "v2.0",
-  "changelog": "采纳梦境实验室变体 let-winners-run: 关闭分层止盈 + 趋势退出兜底（线上 LET_WINNERS_RUN 形态）",
-  "reason": "回测 2025-06-10~2026-06-09 得分 69.361（年化 +74.80%, 回撤 -10.89%）",
-  "created_at": "2026-06-10",
+  "version": "v2.2",
+  "parent": "v2.1",
+  "changelog": "采纳梦境实验室变体 v21-pm-gated: v2.1 + 总仓位管理（分批建仓/超配回撤，HS300 200日线下不建仓）。信号买入规则证据不足保持禁用。",
+  "reason": "三窗口回测: A 2025-06~2026-06 得分 65.90(基线 68.75, 回撤 -9.16% 优于 -10.89%); B 2024-06~2025-06 得分 -6.35(基线 -11.52, 亏损年 -4.06% 转正 +1.07%); C 2023-06~2024-06 得分 -2.12(基线 1.06)。合计 57.43 vs 58.29, 分差 0.86 在噪声内; 按最差窗口保护 + Sharpe 两胜一负 + 自主仓位管理诉求晋升。",
+  "created_at": "2026-06-13",
   "created_by": "strategy_lab",
   "rules": {
     "buy_preconditions": {
@@ -403,6 +403,16 @@
         "severity": "warn",
         "enabled": true,
         "zh": "无法获取基金数据，跳过决策"
+      },
+      "position_build": {
+        "severity": "info",
+        "enabled": true,
+        "zh": "总仓位低于目标下限分批建仓（200日线上方才触发）"
+      },
+      "position_cap_trim": {
+        "severity": "warn",
+        "enabled": true,
+        "zh": "总仓位超 regime 上限回撤最大持仓"
       }
     },
     "take_profit_policy": {
@@ -416,6 +426,25 @@
     "trend_filter": {
       "enabled": true,
       "low_buy_factor": 0.5
+    },
+    "position_management": {
+      "enabled": true,
+      "target_floor": {
+        "牛市": 0.7,
+        "震荡市": 0.5,
+        "熊市": 0.3
+      },
+      "tolerance": 0.05,
+      "batch_fraction": 0.1,
+      "max_funds_per_batch": 2,
+      "min_order_amount": 300,
+      "require_trend_above": true
+    },
+    "fund_constraints": {
+      "006479": {
+        "max_daily_buy": 10,
+        "note": "QDII 限购 ¥10/天，已有定投"
+      }
     }
   }
 }
