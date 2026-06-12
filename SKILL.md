@@ -135,9 +135,11 @@ python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 500
 
 `--engine` 旗标让回测每天调 `DecisionEngine.decide()` 而不是 simulate.py 的内置规则。验证实盘策略最快的方式。
 
-### 2.3 信号字段（Phase 3 新增，观测用）
+### 2.3 信号字段（Phase 3 引入，P6 起部分接入规则）
 
-`actions[].context.signals` 含 4 个技术指标，**不影响决策触发，只供报告显示**：
+`actions[].context.signals` 含 4 个技术指标。P6 起，若决策树版本启用了
+`signal_rules`（rsi_buy / breakout_buy / rsi_trim），RSI 与 20 日突破会**直接触发买卖规则**；
+未启用的版本仍只作观测显示：
 
 | 字段 | 含义 | 解读 |
 |------|------|------|
@@ -158,6 +160,11 @@ python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 500
 - ✅ `alerts[]` 必须在报告里完整展示。
 - ❌ 不要自己计算"现金 <10% 不能买"等阈值 — 引擎已经做过。
 - ❌ 不要自己判断"震荡市/熊市"——读 `market_regime.label`。
+- ✅ P6 起决策包必带 `portfolio_advice`（总仓位 vs 目标区间 + 建议文案），
+  **每次报告都要展示**——用户最关心"我现在仓位健康吗、还能买多少"。
+- ✅ 给用户的每条 buy/sell 建议都配"照抄指令"（`decide.py --format md` 已自动生成：
+  买入 = 在天天基金/支付宝搜代码买 ¥金额；卖出 = 按份额卖）。006479 等限购基金
+  引擎已按 `fund_constraints` 裁剪金额，不要手工放大。
 
 ### 2.5 技术/波动/新闻 加权（报告层，不改引擎决策）
 
@@ -647,6 +654,12 @@ python3 scripts/strategy_lab.py run \
 | `drawdown_protection` | 回撤保护 | 警 | 组合从峰值回撤 ≥ 10% |
 | `low_buy_deferred_drawdown` | 低吸暂缓 | 观察 | 回撤保护下 low_buy 降级 |
 | `data_missing` | 数据缺失 | 警 | 某基金 NAV 拉不到 |
+| `position_build` | 分批建仓 | 买 | 总仓位低于 regime 目标下限（P6，须版本启用） |
+| `position_cap_trim` | 总仓位超限回撤 | 卖 | 总仓位超 regime 上限 + 容差（P6） |
+| `rsi_oversold_buy` | RSI超卖低吸 | 买 | RSI(14) ≤ 阈值（P6，须版本启用） |
+| `momentum_breakout` | 20日突破顺势买 | 买 | 创20日新高且MA20上行（P6） |
+| `rsi_overbought_trim` | RSI超买减仓 | 卖 | RSI ≥ 阈值且浮盈达标（P6） |
+| `trend_exit_ma200` | 趋势破位退出 | 卖 50% | 参考指数连续收于200日线下（P5/v2.1） |
 
 详细决策树见 `data/decision_tree.md`，引擎实现见 `scripts/decision_engine.py`。
 

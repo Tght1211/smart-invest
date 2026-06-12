@@ -171,11 +171,11 @@ def _preload_data(fund_pool, start, end, lookback_days=450):
     import time as _time
     for secid, name in secids.items():
         data = {}
-        for attempt in range(4):  # CDN 偶发掐连接，指数数据是趋势规则的命根子
+        for attempt in range(7):  # CDN 偶发掐连接，指数数据是趋势规则的命根子
             data = fetch_index_history(secid, ext_start, end)
             if data:
                 break
-            _time.sleep(2.0 * (attempt + 1))
+            _time.sleep(3.0 * (attempt + 1))
         index_data[secid] = data
         print(f"  {name}({secid}): {len(data)} 条")
     if not index_data.get("1.000300"):
