@@ -93,6 +93,18 @@ def make_variants(base_rules=None):
     trend_exit = {"enabled": True, "confirm_days": 2, "sell_fraction": 0.5}
     trend_filter = {"enabled": True, "low_buy_factor": 0.5}
     tp_off = {"mode": "off"}
+
+    # P6: v2.1 线上形态（关止盈 + 趋势退出/闸门）作为新基线
+    v21 = {"take_profit_policy": dict(tp_off),
+           "trend_exit": dict(trend_exit), "trend_filter": dict(trend_filter)}
+    pm = {"enabled": True,
+          "target_floor": {"牛市": 0.70, "震荡市": 0.50, "熊市": 0.30},
+          "tolerance": 0.05, "batch_fraction": 0.10,
+          "max_funds_per_batch": 2, "min_order_amount": 300}
+    sig_buys = {"rsi_buy": {"enabled": True, "threshold": 32, "amount_ratio": 0.03},
+                "breakout_buy": {"enabled": True, "amount_ratio": 0.03}}
+    sig_trim = {"rsi_trim": {"enabled": True, "threshold": 82,
+                             "min_profit": 0.15, "sell_fraction": 0.20}}
     return [
         _v("baseline-v2.0", "现行 v2.0 规则（对照组）"),
         _v("trend-exit", "v2.0 + 200日线破位减仓（Faber 趋势退出）",
@@ -109,6 +121,18 @@ def make_variants(base_rules=None):
            trend_exit=dict(trend_exit), trend_filter=dict(trend_filter)),
         _v("let-winners-run-raw", "只关止盈、无趋势兜底（验证趋势退出的增量价值）",
            take_profit_policy=dict(tp_off)),
+        # ---- P6 变体（基线 = v2.1 线上形态）----
+        _v("baseline-v2.1", "现行 v2.1 规则（P6 对照组）", **copy.deepcopy(v21)),
+        _v("v21-position-mgmt", "v2.1 + 总仓位管理（分批建仓/超配回撤）",
+           **copy.deepcopy(v21), position_management=copy.deepcopy(pm)),
+        _v("v21-signal-buys", "v2.1 + RSI超卖低吸 + 20日突破顺势买",
+           **copy.deepcopy(v21), signal_rules=copy.deepcopy(sig_buys)),
+        _v("v21-full-arsenal", "v2.1 + 仓位管理 + 信号买入（P6 主推组合）",
+           **copy.deepcopy(v21), position_management=copy.deepcopy(pm),
+           signal_rules=copy.deepcopy(sig_buys)),
+        _v("v21-full-plus-trim", "P6 主推 + RSI超买减仓（软利润保护）",
+           **copy.deepcopy(v21), position_management=copy.deepcopy(pm),
+           signal_rules={**copy.deepcopy(sig_buys), **copy.deepcopy(sig_trim)}),
     ]
 
 
@@ -131,11 +155,13 @@ def _preload_data(fund_pool, start, end, lookback_days=450):
                           BENCHMARKS, QDII_REF_INDEX)
     ext_start = (datetime.strptime(start, "%Y-%m-%d")
                  - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    print(f"📡 预加载数据：基金 {len(fund_pool)} 只 ({start}~{end})，"
-          f"指数自 {ext_start}（200日线需要）")
+    nav_start = (datetime.strptime(start, "%Y-%m-%d")
+                 - timedelta(days=90)).strftime("%Y-%m-%d")
+    print(f"📡 预加载数据：基金 {len(fund_pool)} 只 (净值自 {nav_start} 预热信号, "
+          f"窗口 {start}~{end})，指数自 {ext_start}（200日线需要）")
     fund_navs = {}
     for code, name in fund_pool.items():
-        navs = fetch_nav_history(code, start, end)
+        navs = fetch_nav_history(code, nav_start, end)
         fund_navs[code] = navs
         print(f"  {code} {name}: {len(navs)} 条")
     index_data = {}
@@ -256,9 +282,15 @@ def cmd_run(args):
         champion = ranked[0]
         baseline = next((r for r in ranked if r["name"] == "baseline-v2.0"), None)
 
+        try:
+            with open(DATA_DIR / "decision_tree.json", "r", encoding="utf-8") as f:
+                live_version = json.load(f).get("version", "v2.0")
+        except Exception:
+            live_version = "v2.0"
+
         if args.evolve and baseline and champion["name"] != "baseline-v2.0":
             db.add_evolution(
-                from_version="v2.0", to_version=champion["name"],
+                from_version=live_version, to_version=champion["name"],
                 title=f"梦境实验室冠军: {champion['name']}",
                 description=champion["desc"],
                 trigger_source="strategy_lab",
@@ -281,7 +313,7 @@ def cmd_run(args):
                       f"（年化 {chosen['metrics']['annual_return_pct']:+.2f}%, "
                       f"回撤 {chosen['metrics']['max_drawdown_pct']:.2f}%）")
             db.add_tree_version(
-                version=args.promote, parent_version="v2.0",
+                version=args.promote, parent_version=live_version,
                 changelog=changelog, reason=reason,
                 rules_json=chosen["rules"],
                 evidence=json.dumps({"ranking": [
@@ -293,7 +325,7 @@ def cmd_run(args):
             tree_file = DATA_DIR / "decision_tree.json"
             tree = {
                 "version": args.promote,
-                "parent": "v2.0",
+                "parent": live_version,
                 "changelog": changelog,
                 "reason": reason,
                 "created_at": datetime.now().strftime("%Y-%m-%d"),

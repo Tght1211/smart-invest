@@ -221,10 +221,13 @@ class Simulator:
             return
         print(f"📡 加载历史数据 ({self.start_date} ~ {self.end_date})...")
 
-        # 加载基金净值
+        # 加载基金净值（向前多拉 90 天作信号预热：RSI/MACD/突破从窗口首日即可用；
+        # trading_days 仍限定窗口内，无未来函数）
+        nav_start = (datetime.strptime(self.start_date, "%Y-%m-%d")
+                     - timedelta(days=90)).strftime("%Y-%m-%d")
         for i, (code, name) in enumerate(self.fund_names.items()):
             print(f"  [{i+1}/{len(self.fund_names)}] {code} {name}...", end=" ", flush=True)
-            navs = fetch_nav_history(code, self.start_date, self.end_date)
+            navs = fetch_nav_history(code, nav_start, self.end_date)
             self.fund_navs[code] = navs
             print(f"{len(navs)} 条数据")
             time.sleep(0.3)
@@ -244,8 +247,9 @@ class Simulator:
             time.sleep(1)
 
     def get_trading_days(self):
-        """获取交易日列表"""
-        return get_trading_days(self.fund_navs)
+        """获取交易日列表（限定回测窗口内；窗口前的净值只用于信号预热）"""
+        return [d for d in get_trading_days(self.fund_navs)
+                if self.start_date <= d <= self.end_date]
 
     def get_nav(self, code, date):
         """获取基金在某天的净值"""
@@ -585,6 +589,15 @@ class Simulator:
                 "high_20d": high_20d,
                 "sector": sector,
             }
+            # P6: 技术信号（只用 ≤date 的净值，含窗口前预热数据，无未来函数）
+            try:
+                import signals as _sig
+                nav_dict = self.fund_navs.get(code) or {}
+                series = [nav_dict[d] for d in sorted(nav_dict) if d <= date]
+                if len(series) >= 15:
+                    funds[code]["signals"] = _sig.attach_signals(series[-60:])
+            except ImportError:
+                pass
 
         # P5 趋势状态：HS300/NDX 200日线（只用 ≤date 的收盘，无未来函数；
         # 数据不足 200 天时为 None → 引擎自动跳过趋势规则）
