@@ -135,6 +135,23 @@ class PositionBuildTest(PositionRulesTestBase):
         builds = self._builds(packet)
         self.assertEqual([b["code"] for b in builds], ["512480"])
 
+    def test_require_trend_above_blocks_build_below_ma200(self):
+        """P6.1 强趋势闸门：HS300 在 200 日线下方 → 完全不建仓。"""
+        self.rules["position_management"]["require_trend_above"] = True
+        md = make_market_data(index_trend={"HS300": {
+            "ma": 3500.0, "gap_pct": -0.03, "below_days": 5, "above": False}})
+        packet = self._decide(md, positions=[],
+                              cash=10000.0, total_value=10000.0)
+        self.assertEqual(self._builds(packet), [])
+
+    def test_require_trend_above_allows_build_above_ma200(self):
+        self.rules["position_management"]["require_trend_above"] = True
+        md = make_market_data(index_trend={"HS300": {
+            "ma": 3500.0, "gap_pct": 0.02, "below_days": 0, "above": True}})
+        packet = self._decide(md, positions=[],
+                              cash=10000.0, total_value=10000.0)
+        self.assertEqual(len(self._builds(packet)), 2)
+
     def test_drawdown_protection_skips_position_build(self):
         md = make_market_data(portfolio_peak_value=12000.0)
         packet = self._decide(md, positions=[],

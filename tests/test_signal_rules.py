@@ -152,6 +152,26 @@ class BreakoutBuyTest(SignalRulesTestBase):
         self.assertTrue(find_blocked(packet, "512480", "anti_chase"))
 
 
+class TrendGateTest(SignalRulesTestBase):
+    def test_require_trend_above_blocks_signal_buys_below_ma200(self):
+        self.rules["signal_rules"]["require_trend_above"] = True
+        md = self._md_with_signals(**{"512480": {"rsi_14": 28.0}})
+        md["index_trend"] = {"HS300": {"ma": 3500.0, "gap_pct": -0.03,
+                                       "below_days": 5, "above": False}}
+        packet = self._decide(md, positions=[])
+        self.assertEqual(find_action(packet, "512480", "buy"), [])
+
+    def test_require_trend_above_allows_when_above(self):
+        self.rules["signal_rules"]["require_trend_above"] = True
+        md = self._md_with_signals(**{"512480": {"rsi_14": 28.0}})
+        md["index_trend"] = {"HS300": {"ma": 3500.0, "gap_pct": 0.02,
+                                       "below_days": 0, "above": True}}
+        packet = self._decide(md, positions=[])
+        buys = find_action(packet, "512480", "buy")
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]["rule_id"], "rsi_oversold_buy")
+
+
 class RsiTrimTest(SignalRulesTestBase):
     def _pos(self, cost_nav=1.90):
         # current_nav 2.30 → profit ≈ +21%

@@ -859,6 +859,31 @@ def cmd_add_order(args):
         reason=args.note
     )
     print(f"[OK] 订单已添加: {args.action.upper()} {args.code} {args.name}")
+    # P6: 订单即真实买卖，默认同步扣/回现金（外部资金注入用 --no-cash 跳过）
+    if not getattr(args, "no_cash", False):
+        delta = -args.amount if args.action == "buy" else args.amount
+        new_cash = (account["cash"] or 0.0) + delta
+        db.update_account(account["id"], cash=new_cash)
+        print(f"[OK] 现金已更新: ¥{account['cash']:,.2f} → ¥{new_cash:,.2f}")
+    db.close()
+
+
+def cmd_cash(args):
+    """查看/校准账户现金（仓位管理依赖现金准确）"""
+    db = Database()
+    account = db.get_account(name=args.account)
+    if not account:
+        print(f"[ERROR] 账户不存在: {args.account}")
+        return
+    cash = account["cash"] or 0.0
+    if args.set is not None:
+        db.update_account(account["id"], cash=args.set)
+        print(f"[OK] 现金: ¥{cash:,.2f} → ¥{args.set:,.2f}")
+    elif args.adjust is not None:
+        db.update_account(account["id"], cash=cash + args.adjust)
+        print(f"[OK] 现金: ¥{cash:,.2f} → ¥{cash + args.adjust:,.2f}")
+    else:
+        print(f"账户 {args.account} 现金: ¥{cash:,.2f}（预算 ¥{account['budget']:,.2f}）")
     db.close()
 
 
@@ -912,6 +937,14 @@ def main():
     p_add_order.add_argument("--nav", type=float, required=True, help="成交净值")
     p_add_order.add_argument("--shares", type=float, required=True, help="交易份额")
     p_add_order.add_argument("--note", help="备注")
+    p_add_order.add_argument("--no-cash", dest="no_cash", action="store_true",
+                             help="不同步调整现金（外部资金注入时用）")
+
+    # 现金校准
+    p_cash = sub.add_parser("cash", help="查看/校准账户现金")
+    p_cash.add_argument("--account", "-a", required=True, help="账户名称")
+    p_cash.add_argument("--set", type=float, default=None, help="直接设置现金")
+    p_cash.add_argument("--adjust", type=float, default=None, help="增减现金（可负）")
 
     args = parser.parse_args()
     if not args.command:
@@ -930,6 +963,7 @@ def main():
         "add-position": cmd_add_position,
         "remove-position": cmd_remove_position,
         "add-order": cmd_add_order,
+        "cash": cmd_cash,
     }
 
     commands[args.command](args)

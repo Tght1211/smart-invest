@@ -395,6 +395,7 @@ def auto_record(db, ctx, account, do_email=True):
                             buy_date=today, sector=a.get("sector"), note=rule_id)
             db.add_trade(account_id, today, code, name, "buy", amt, nav, shares,
                          rule_name=rule_id)
+            _adjust_cash(db, account_id, -amt)
             recorded.append(f"买入「{_short_name(name)}」¥{amt:,.0f}（支付宝搜 {code}）")
             if do_email:
                 _notify(account, "buy", code, name, amt, nav, shares, a.get("rule_label", ""))
@@ -412,10 +413,20 @@ def auto_record(db, ctx, account, do_email=True):
             db.update_position_shares(account_id, code, -shares)
             db.add_trade(account_id, today, code, name, "sell", amt, nav, shares,
                          rule_name=rule_id)
+            _adjust_cash(db, account_id, amt)
             recorded.append(f"卖出「{_short_name(name)}」约 {shares:,.0f} 份（¥{amt:,.0f}）")
             if do_email:
                 _notify(account, "sell", code, name, amt, nav, shares, a.get("rule_label", ""))
     return recorded, skipped
+
+
+def _adjust_cash(db, account_id, delta):
+    """买卖后同步账户现金（P6：仓位管理依赖现金准确）。"""
+    row = db.conn.execute(
+        "SELECT cash FROM accounts WHERE id = ?", (account_id,)
+    ).fetchone()
+    if row is not None:
+        db.update_account(account_id, cash=(row["cash"] or 0.0) + delta)
 
 
 def _accum_shares(db, account_id, code, add):

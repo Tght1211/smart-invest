@@ -264,7 +264,8 @@ python3 scripts/fetch_fund.py news --keyword 半导体            # 免费财经
      --shares <份额> --cost <成交净值> \
      --date <YYYY-MM-DD> --sector <赛道> --note "<规则名>"
    ```
-3. **写订单**：
+3. **写订单**（P6 起 `add-order` 默认同步扣减账户现金；若资金是预算外新注入的，
+   加 `--no-cash` 并另行用 `db.py cash --adjust <金额>` 注资）：
    ```bash
    python3 scripts/db.py add-order \
      --account 主线 --date <YYYY-MM-DD> --code <code> --name "<name>" \
@@ -272,6 +273,9 @@ python3 scripts/fetch_fund.py news --keyword 半导体            # 免费财经
      --note "<规则名>"
    ```
 4. **发交易通知邮件**（强制，见 §4.4）。
+
+> 💡 现金准确是仓位管理的前提。怀疑现金对不上时：
+> `python3 scripts/db.py cash --account 主线`（查看）/ `--set <金额>`（校准）。
 
 ### 4.3 卖出 / 减仓
 

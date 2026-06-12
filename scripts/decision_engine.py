@@ -624,6 +624,12 @@ class DecisionEngine:
         if not sr or not sig:
             return None, None
 
+        # P6.1 强趋势闸门：HS300 不在 200 日线上方时信号买入整体停火
+        if sr.get("require_trend_above"):
+            t = regime.get("hs300_trend")
+            if not (t and t.get("above")):
+                return None, None
+
         candidate = None  # (rule_id, label, ratio, reason, trend_gate)
         rsi_cfg = sr.get("rsi_buy") or {}
         rsi = sig.get("rsi_14")
@@ -723,6 +729,13 @@ class DecisionEngine:
         if pos_pct >= floor - tol:
             return []
 
+        # P6.1 强趋势闸门：HS300 不在 200 日线上方时完全不建仓
+        # （证据：2023-06~2024-06 下跌年，减半闸门仍亏 -2.7%，基线 +4.1%）
+        hs300_trend = regime.get("hs300_trend")
+        if pm.get("require_trend_above") and not (
+                hs300_trend and hs300_trend.get("above")):
+            return []
+
         gap = floor - pos_pct
         deploy = min(gap, pm.get("batch_fraction", 0.10)) * total_value
         deploy = min(deploy, cash - 0.10 * total_value)  # 保住现金储备线
@@ -733,7 +746,6 @@ class DecisionEngine:
         # 趋势闸门：HS300 在 200 日线下时本批部署额打折
         trend_gated = False
         tf = self.rules.get("trend_filter") or {}
-        hs300_trend = regime.get("hs300_trend")
         if (tf.get("enabled") and hs300_trend
                 and not hs300_trend.get("above", True)):
             deploy *= tf.get("low_buy_factor", 0.5)

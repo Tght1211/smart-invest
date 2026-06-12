@@ -133,6 +133,14 @@ def make_variants(base_rules=None):
         _v("v21-full-plus-trim", "P6 主推 + RSI超买减仓（软利润保护）",
            **copy.deepcopy(v21), position_management=copy.deepcopy(pm),
            signal_rules={**copy.deepcopy(sig_buys), **copy.deepcopy(sig_trim)}),
+        # ---- P6.1 强趋势闸门（200日线下完全停火，证据：窗口C 下跌年）----
+        _v("v21-pm-gated", "仓位管理 + 200日线下不建仓",
+           **copy.deepcopy(v21),
+           position_management={**copy.deepcopy(pm), "require_trend_above": True}),
+        _v("v21-arsenal-gated", "仓位管理 + 信号买入，均 200日线下停火",
+           **copy.deepcopy(v21),
+           position_management={**copy.deepcopy(pm), "require_trend_above": True},
+           signal_rules={**copy.deepcopy(sig_buys), "require_trend_above": True}),
     ]
 
 
