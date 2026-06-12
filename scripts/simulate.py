@@ -158,17 +158,23 @@ def fetch_index_history(secid, start_date, end_date):
         f"&klt=101&fqt=0&beg={beg}&end={end}"
     )
     text = _get(url)
-    if not text:
-        return {}
-
-    data = json.loads(text)
-    inner = data.get("data") or {}
-    klines = inner.get("klines") or []
     result = {}
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) >= 3:
-            result[parts[0]] = float(parts[2])  # close price
+    if text:
+        data = json.loads(text)
+        inner = data.get("data") or {}
+        for line in inner.get("klines") or []:
+            parts = line.split(",")
+            if len(parts) >= 3:
+                result[parts[0]] = float(parts[2])  # close price
+    if not result:
+        # 东财 push2his 整体故障时走备源（新浪 A 股 / 腾讯纳指）
+        try:
+            from fetch_fund import fetch_index_daily_fallback
+            result = fetch_index_daily_fallback(secid, start_date, end_date)
+            if result:
+                print(f"  [备源] {secid} 经新浪/腾讯取得 {len(result)} 条")
+        except Exception:
+            pass
     return result
 
 

@@ -1168,6 +1168,44 @@ def _infer_sector(name):
     return "其他"
 
 
+def fetch_index_daily_fallback(secid, start_date, end_date):
+    """东财 push2his 挂掉时的指数日K备源：A股指数走新浪，纳指走腾讯。
+
+    start/end: YYYY-MM-DD。返回 {date: close}（仅区间内）。任何失败返回 {}。
+    新浪单次最多 1023 根日K（约可回看 4 年）；腾讯按区间+条数取。
+    """
+    out = {}
+    try:
+        if secid.startswith(("0.", "1.")):
+            sym = ("sh" if secid.startswith("1.") else "sz") + secid.split(".")[1]
+            url = (
+                "https://quotes.sina.cn/cn/api/json_v2.php/"
+                "CN_MarketDataService.getKLineData?"
+                f"symbol={sym}&scale=240&ma=no&datalen=1023"
+            )
+            text = _get(url)
+            if text:
+                for r in json.loads(text):
+                    d, c = r.get("day"), r.get("close")
+                    if d and c and start_date <= d <= end_date:
+                        out[d] = float(c)
+        elif secid == "100.NDX":
+            url = (
+                "https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get?"
+                f"param=us.NDX,day,{start_date},{end_date},800,qfq"
+            )
+            text = _get(url)
+            if text:
+                data = json.loads(text).get("data", {}).get("us.NDX", {})
+                rows = data.get("qfqday") or data.get("day") or []
+                for parts in rows:
+                    if len(parts) >= 3 and start_date <= parts[0] <= end_date:
+                        out[parts[0]] = float(parts[2])
+    except Exception:
+        return {}
+    return out
+
+
 def _index_closes(secid, days=320):
     """指数日K收盘序列（升序），失败返回 []。供 200 日线状态计算。"""
     try:
@@ -1180,10 +1218,13 @@ def _index_closes(secid, days=320):
             f"&klt=101&fqt=0&beg={start_date}&end={end_date}"
         )
         text = _get(url)
-        if not text:
-            return []
-        klines = json.loads(text).get("data", {}).get("klines", [])
-        return [float(k.split(",")[1]) for k in klines]
+        klines = (json.loads(text).get("data", {}) or {}).get("klines", []) if text else []
+        if klines:
+            return [float(k.split(",")[1]) for k in klines]
+        # 东财失败 → 备源（新浪/腾讯）
+        iso = lambda s: f"{s[:4]}-{s[4:6]}-{s[6:]}"
+        data = fetch_index_daily_fallback(secid, iso(start_date), iso(end_date))
+        return [data[d] for d in sorted(data)]
     except Exception:
         return []
 
@@ -1213,13 +1254,16 @@ def _hs300_returns():
             f"&klt=101&fqt=0&beg={start_date}&end={end_date}"
         )
         text = _get(url)
-        if not text:
-            return None, None
-        data = json.loads(text)
-        klines = data.get("data", {}).get("klines", [])
-        if len(klines) < 21:
-            return None, None
+        klines = (json.loads(text).get("data", {}) or {}).get("klines", []) if text else []
         closes = [float(k.split(",")[2]) for k in klines]
+        if len(closes) < 21:
+            # 东财失败 → 备源（新浪）
+            iso = lambda s: f"{s[:4]}-{s[4:6]}-{s[6:]}"
+            data = fetch_index_daily_fallback(
+                "1.000300", iso(start_date), iso(end_date))
+            closes = [data[d] for d in sorted(data)]
+        if len(closes) < 21:
+            return None, None
         latest = closes[-1]
         five_ago = closes[-6]
         twenty_ago = closes[-21]
