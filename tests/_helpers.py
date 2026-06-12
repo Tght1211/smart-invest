@@ -16,14 +16,16 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 def load_rules():
     """Load v2.0-baseline rules from data/decision_tree.json.
 
-    strategy_lab --promote 会把 P5 键（take_profit_policy/trend_exit/trend_filter）
-    写进 live 文件；引擎行为 pin 测试基于 v2.0 基线，所以这里剥离 P5 键。
-    需要 P5 行为的测试自己显式加键（见 test_trend_rules.py）。
+    strategy_lab --promote 会把 P5/P6 键（take_profit_policy/trend_exit/trend_filter/
+    position_management/signal_rules/fund_constraints）写进 live 文件；
+    引擎行为 pin 测试基于 v2.0 基线，所以这里剥离这些键。
+    需要 P5/P6 行为的测试自己显式加键（见 test_trend_rules.py / test_position_rules.py）。
     """
     with open(REPO_ROOT / "data" / "decision_tree.json", "r", encoding="utf-8") as f:
         tree = json.load(f)
     rules = tree.get("rules", tree)
-    for k in ("take_profit_policy", "trend_exit", "trend_filter"):
+    for k in ("take_profit_policy", "trend_exit", "trend_filter",
+              "position_management", "signal_rules", "fund_constraints"):
         rules.pop(k, None)
     return rules
 

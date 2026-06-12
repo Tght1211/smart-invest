@@ -145,6 +145,7 @@ class DecisionEngine:
             "rule_version": self.strategy_version,
             "market_regime": regime,
             "portfolio_snapshot": snapshot,
+            "portfolio_advice": self._compute_portfolio_advice(snapshot, regime),
             "actions": actions,
             "blocked_actions": blocked,
             "alerts": alerts,
@@ -574,6 +575,344 @@ class DecisionEngine:
             f"盈利 {profit_pct * 100:.1f}% ≥ 20%，减仓 25%。",
         )
 
+    # ---------- P6: 信号规则（RSI 超卖低吸 / 20日突破顺势 / RSI 超买减仓）----------
+
+    DEFAULT_TARGET_FLOOR = {"牛市": 0.70, "震荡市": 0.50, "熊市": 0.30}
+
+    def _try_rsi_trim(self, code, fund, position):
+        """RSI 超买 + 浮盈达标 → 减仓（LET_WINNERS_RUN 的软利润保护）。"""
+        cfg = (self.rules.get("signal_rules") or {}).get("rsi_trim") or {}
+        if not cfg.get("enabled"):
+            return None
+        sig = fund.get("signals") or {}
+        rsi = sig.get("rsi_14")
+        if rsi is None or rsi < cfg.get("threshold", 82):
+            return None
+        nav = fund.get("current_nav", position["cost_nav"])
+        profit_pct = (
+            (nav - position["cost_nav"]) / position["cost_nav"]
+            if position["cost_nav"] else 0.0
+        )
+        if profit_pct < cfg.get("min_profit", 0.15):
+            return None
+        fraction = cfg.get("sell_fraction", 0.20)
+        return {
+            "code": code,
+            "name": position.get("name") or fund.get("name", ""),
+            "action": "sell",
+            "rule_id": "rsi_overbought_trim",
+            "rule_label": "RSI超买减仓",
+            "confidence": None,
+            "suggested_amount": round(position["shares"] * fraction * nav, 2),
+            "suggested_shares": round(position["shares"] * fraction, 4),
+            "context": {"profit_pct": profit_pct, "rsi_14": rsi, "signals": sig},
+            "checks_passed": [],
+            "checks_failed": [],
+            "reason_zh": (
+                f"RSI(14)={rsi:.0f} ≥ {cfg.get('threshold', 82)} 超买，"
+                f"浮盈 {profit_pct * 100:.1f}%，减仓 {fraction * 100:.0f}% 锁定部分利润。"
+            ),
+        }
+
+    def _try_signal_buy(self, code, fund, snapshot, regime, total_value):
+        """RSI 超卖低吸 / 20日突破顺势买。low_buy 未触发时才尝试。
+
+        Return (action, blocked) — 与 _try_low_buy 同构。
+        """
+        sr = self.rules.get("signal_rules") or {}
+        sig = fund.get("signals") or {}
+        if not sr or not sig:
+            return None, None
+
+        candidate = None  # (rule_id, label, ratio, reason, trend_gate)
+        rsi_cfg = sr.get("rsi_buy") or {}
+        rsi = sig.get("rsi_14")
+        if (rsi_cfg.get("enabled") and rsi is not None
+                and rsi <= rsi_cfg.get("threshold", 32)):
+            candidate = (
+                "rsi_oversold_buy", "RSI超卖低吸",
+                rsi_cfg.get("amount_ratio", 0.03),
+                f"RSI(14)={rsi:.0f} ≤ {rsi_cfg.get('threshold', 32)}，"
+                f"超卖区分批低吸。",
+                True,
+            )
+        if candidate is None:
+            bo_cfg = sr.get("breakout_buy") or {}
+            if (bo_cfg.get("enabled") and sig.get("breakout_20d")
+                    and (sig.get("ma20_slope") or 0.0) > 0
+                    and regime["label"] in ("牛市", "震荡市")):
+                candidate = (
+                    "momentum_breakout", "20日突破顺势买",
+                    bo_cfg.get("amount_ratio", 0.03),
+                    f"创 20 日新高且 MA20 向上"
+                    f"（斜率 {sig.get('ma20_slope', 0) * 100:.2f}%/日），顺势加仓。",
+                    False,
+                )
+        if candidate is None:
+            return None, None
+
+        rule_id, label, ratio, reason, gate = candidate
+        target_amount = total_value * ratio
+        trend_gated = False
+        tf = self.rules.get("trend_filter") or {}
+        hs300_trend = regime.get("hs300_trend")
+        if (gate and tf.get("enabled") and hs300_trend
+                and not hs300_trend.get("above", True)):
+            target_amount *= tf.get("low_buy_factor", 0.5)
+            trend_gated = True
+
+        existing = next(
+            (p for p in snapshot["by_position"] if p["code"] == code), None,
+        )
+        sector = fund.get("sector") or "其他"
+        checks_passed, checks_failed = [], []
+        for ok, info in [
+            self._check_cash_reserve(snapshot["cash_pct"]),
+            self._check_single_position(code, snapshot, target_amount, total_value),
+            self._check_sector_concentration(sector, snapshot, target_amount, total_value),
+            self._check_anti_chase(fund),
+            self._check_market_allows_buy(regime, has_existing_position=existing is not None),
+        ]:
+            (checks_passed if ok else checks_failed).append(info)
+
+        context = {
+            "fund_5d_return": fund.get("fund_5d_return", 0.0),
+            "fund_day_return": fund.get("day_return", 0.0),
+            "hs300_5d_return": regime.get("hs300_5d_return", 0.0),
+            "signals": sig,
+        }
+        if checks_failed:
+            primary = checks_failed[0]
+            return None, {
+                "code": code,
+                "name": fund.get("name", ""),
+                "attempted_action": "buy",
+                "blocked_by": primary["id"],
+                "reason_zh": self._block_reason_zh(primary, context),
+            }
+        return {
+            "code": code,
+            "name": fund.get("name", ""),
+            "action": "buy",
+            "rule_id": rule_id,
+            "rule_label": label,
+            "confidence": None,
+            "suggested_amount": round(target_amount, 2),
+            "suggested_shares": None,
+            "context": context,
+            "checks_passed": checks_passed,
+            "checks_failed": [],
+            "reason_zh": reason + (
+                "（HS300 处于200日线下方，趋势闸门已将金额打折）"
+                if trend_gated else ""
+            ),
+        }, None
+
+    # ---------- P6: 总仓位管理（分批建仓 / 超配回撤）----------
+
+    def _try_position_build(self, snapshot, regime, funds, positions,
+                            cash, total_value, buy_codes, positions_with_sell):
+        """总仓位低于目标下限时，按动量挑候选分批建仓。返回 action 列表。"""
+        pm = self.rules.get("position_management") or {}
+        if not pm.get("enabled") or regime["label"] == "unknown":
+            return []
+        floors = pm.get("target_floor") or self.DEFAULT_TARGET_FLOOR
+        floor = floors.get(regime["label"], 0.50)
+        tol = pm.get("tolerance", 0.05)
+        pos_pct = snapshot["position_pct"]
+        if pos_pct >= floor - tol:
+            return []
+
+        gap = floor - pos_pct
+        deploy = min(gap, pm.get("batch_fraction", 0.10)) * total_value
+        deploy = min(deploy, cash - 0.10 * total_value)  # 保住现金储备线
+        min_order = pm.get("min_order_amount", 300)
+        if deploy < min_order:
+            return []
+
+        # 趋势闸门：HS300 在 200 日线下时本批部署额打折
+        trend_gated = False
+        tf = self.rules.get("trend_filter") or {}
+        hs300_trend = regime.get("hs300_trend")
+        if (tf.get("enabled") and hs300_trend
+                and not hs300_trend.get("above", True)):
+            deploy *= tf.get("low_buy_factor", 0.5)
+            trend_gated = True
+            if deploy < min_order:
+                return []
+
+        fc = self.rules.get("fund_constraints") or {}
+        cands = []
+        for code, fund in funds.items():
+            if code in buy_codes or code in positions_with_sell:
+                continue
+            existing = any(p["code"] == code for p in positions)
+            ok, _ = self._check_market_allows_buy(regime, existing)
+            if not ok:
+                continue
+            if (fund.get("fund_5d_return") or 0.0) > 0.10:
+                continue  # anti_chase 预筛
+            cap = (fc.get(code) or {}).get("max_daily_buy")
+            if cap is not None and cap < min_order:
+                continue  # 限购基金不占建仓名额
+            cands.append((fund.get("fund_20d_return") or 0.0, code, fund))
+        if not cands:
+            return []
+        cands.sort(key=lambda t: t[0], reverse=True)
+
+        max_n = pm.get("max_funds_per_batch", 2)
+        per = deploy / max_n
+        n = max_n
+        if per < min_order:
+            n = max(1, int(deploy // min_order))
+            per = deploy / n
+
+        out = []
+        for score, code, fund in cands:
+            if len(out) >= n:
+                break
+            sector = fund.get("sector") or "其他"
+            failed = []
+            for ok, info in [
+                self._check_cash_reserve(snapshot["cash_pct"]),
+                self._check_single_position(code, snapshot, per, total_value),
+                self._check_sector_concentration(sector, snapshot, per, total_value),
+                self._check_anti_chase(fund),
+            ]:
+                if not ok:
+                    failed.append(info)
+            if failed:
+                continue  # 不进 blocked，让位给下一名候选
+            context = {
+                "position_pct": pos_pct,
+                "target_floor": floor,
+                "fund_20d_return": fund.get("fund_20d_return", 0.0),
+            }
+            if fund.get("signals"):
+                context["signals"] = fund["signals"]
+            out.append({
+                "code": code,
+                "name": fund.get("name", ""),
+                "action": "buy",
+                "rule_id": "position_build",
+                "rule_label": "分批建仓",
+                "confidence": None,
+                "suggested_amount": round(per, 2),
+                "suggested_shares": None,
+                "context": context,
+                "checks_passed": [],
+                "checks_failed": [],
+                "reason_zh": (
+                    f"总仓位 {pos_pct * 100:.0f}% 低于{regime['label']}"
+                    f"目标下限 {floor * 100:.0f}%，按 20 日动量选入，"
+                    f"本批部署 ¥{per:,.0f}。"
+                    + ("（HS300 处于200日线下方，趋势闸门已将金额打折）"
+                       if trend_gated else "")
+                ),
+            })
+        return out
+
+    def _try_position_cap_trim(self, snapshot, regime, positions_with_sell):
+        """总仓位超过 regime 上限 + 容差 → 卖出最大持仓拉回上限内。"""
+        pm = self.rules.get("position_management") or {}
+        if not pm.get("enabled"):
+            return None
+        tol = pm.get("tolerance", 0.05)
+        cap = regime["position_cap"]
+        pos_pct = snapshot["position_pct"]
+        if pos_pct <= cap + tol:
+            return None
+        cands = [p for p in snapshot["by_position"]
+                 if p["code"] not in positions_with_sell]
+        if not cands:
+            return None
+        target = max(cands, key=lambda p: p["pct_of_total"])
+        sell_amount = min((pos_pct - cap) * snapshot["total_value"],
+                          target["value"])
+        nav = target["current_nav"]
+        return {
+            "code": target["code"],
+            "name": target["name"],
+            "action": "sell",
+            "rule_id": "position_cap_trim",
+            "rule_label": "总仓位超限回撤",
+            "confidence": None,
+            "suggested_amount": round(sell_amount, 2),
+            "suggested_shares": round(sell_amount / nav, 4) if nav else 0.0,
+            "context": {
+                "position_pct": pos_pct,
+                "position_cap": cap,
+                "profit_pct": target.get("profit_pct"),
+            },
+            "checks_passed": [],
+            "checks_failed": [],
+            "reason_zh": (
+                f"总仓位 {pos_pct * 100:.0f}% 超过{regime['label']}上限 "
+                f"{cap * 100:.0f}%，卖出最大持仓 {target['name']} "
+                f"¥{sell_amount:,.0f} 拉回上限内。"
+            ),
+        }
+
+    def _compute_portfolio_advice(self, snapshot, regime):
+        """每个决策包必带的总仓位评估块 —— 用户每天可见仓位状态。"""
+        pm = self.rules.get("position_management") or {}
+        floors = pm.get("target_floor") or self.DEFAULT_TARGET_FLOOR
+        label = regime["label"]
+        floor = floors.get(label, 0.50)
+        cap = regime["position_cap"]
+        tol = pm.get("tolerance", 0.05)
+        pos_pct = snapshot["position_pct"]
+        total = snapshot["total_value"]
+        if pos_pct < floor - tol:
+            status = "underweight"
+        elif pos_pct > cap + tol:
+            status = "overweight"
+        else:
+            status = "in_band"
+        gap_amount = max(0.0, (floor - pos_pct) * total)
+        deployable = max(0.0, snapshot["cash"] - 0.10 * total)
+        if status == "underweight":
+            advice = (
+                f"当前仓位 {pos_pct * 100:.0f}%，低于{label}目标下限 "
+                f"{floor * 100:.0f}%，距目标缺口约 ¥{gap_amount:,.0f}"
+                f"（保留 10% 现金后本批最多可部署 ¥{deployable:,.0f}）。"
+            )
+        elif status == "overweight":
+            advice = (
+                f"当前仓位 {pos_pct * 100:.0f}% 超过{label}上限 "
+                f"{cap * 100:.0f}%，建议减仓约 "
+                f"¥{max(0.0, (pos_pct - cap) * total):,.0f}。"
+            )
+        else:
+            advice = (
+                f"当前仓位 {pos_pct * 100:.0f}% 在{label}目标区间 "
+                f"{floor * 100:.0f}%~{cap * 100:.0f}% 内，维持节奏。"
+            )
+        return {
+            "position_pct": round(pos_pct, 4),
+            "target_floor": floor,
+            "position_cap": cap,
+            "gap_amount": round(gap_amount, 2),
+            "deployable_cash": round(deployable, 2),
+            "status": status,
+            "advice_zh": advice,
+        }
+
+    def _apply_fund_constraints(self, actions):
+        """对 buy action 做限购裁剪（如 006479 QDII 限购 ¥10/天）。"""
+        fc = self.rules.get("fund_constraints") or {}
+        if not fc:
+            return
+        for a in actions:
+            if a.get("action") != "buy":
+                continue
+            cap = (fc.get(a["code"]) or {}).get("max_daily_buy")
+            if cap is not None and (a.get("suggested_amount") or 0.0) > cap:
+                a["suggested_amount"] = float(cap)
+                a["reason_zh"] = (a.get("reason_zh") or "") + (
+                    f"（该基金限购，金额已裁剪为 ¥{cap}/天）"
+                )
+
     # ---------- confidence scoring ----------
 
     def _score_confidence(self, action, position=None):
@@ -647,19 +986,34 @@ class DecisionEngine:
                     code, fund, pos, market_data.get("index_trend") or {},
                 )
             if not sell:
+                sell = self._try_rsi_trim(code, fund, pos)
+            if not sell:
                 sell = self._try_take_profit(code, fund, pos)
             if sell:
                 sell["confidence"] = self._score_confidence(sell, position=pos)
                 actions.append(sell)
                 positions_with_sell.add(code)
 
-        # Pass 2: low_buy on each candidate fund (skip if sell already triggered)
+        # P6: 总仓位超上限 → 回撤最大持仓
+        cap_trim = self._try_position_cap_trim(snapshot, regime, positions_with_sell)
+        if cap_trim:
+            cap_trim["confidence"] = self._score_confidence(cap_trim)
+            actions.append(cap_trim)
+            positions_with_sell.add(cap_trim["code"])
+
+        # Pass 2: buys on each candidate fund (skip if sell already triggered)
+        # 优先级: low_buy > rsi_oversold_buy > momentum_breakout（每基金每日至多一条买入）
+        buy_codes = set()
         for code, fund in funds.items():
             if code in positions_with_sell:
                 continue
             action, block = self._try_low_buy(
                 code, fund, snapshot, regime, cash, total_value,
             )
+            if not action and not block:
+                action, block = self._try_signal_buy(
+                    code, fund, snapshot, regime, total_value,
+                )
             if action:
                 existing = next(
                     (p for p in positions if p["code"] == code), None,
@@ -669,8 +1023,10 @@ class DecisionEngine:
                     actions.append({
                         **action,
                         "action": "watch",
-                        "rule_id": "low_buy_deferred_drawdown",
-                        "rule_label": "低吸暂缓（回撤保护）",
+                        "rule_id": action["rule_id"] + "_deferred_drawdown",
+                        "rule_label": (
+                            action["rule_label"] + "暂缓（回撤保护）"
+                        ),
                         "suggested_amount": 0.0,
                         "confidence": None,
                         "reason_zh": (
@@ -679,8 +1035,24 @@ class DecisionEngine:
                     })
                 else:
                     actions.append(action)
+                    buy_codes.add(code)
             if block:
                 blocked.append(block)
+
+        # Pass 3 (P6): 总仓位低于目标下限 → 分批建仓（回撤保护期间跳过）
+        if not in_drawdown_protection:
+            for b in self._try_position_build(
+                snapshot, regime, funds, positions,
+                cash, total_value, buy_codes, positions_with_sell,
+            ):
+                existing = next(
+                    (p for p in positions if p["code"] == b["code"]), None,
+                )
+                b["confidence"] = self._score_confidence(b, position=existing)
+                actions.append(b)
+
+        # P6: 限购裁剪（最后一道，对所有买入生效）
+        self._apply_fund_constraints(actions)
 
         return actions, blocked, alerts
 
