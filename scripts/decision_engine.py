@@ -863,6 +863,8 @@ class DecisionEngine:
         tol = pm.get("tolerance", 0.05)
         pos_pct = snapshot["position_pct"]
         total = snapshot["total_value"]
+        if label == "unknown":
+            label = "震荡市（大盘数据缺失，按默认口径）"
         if pos_pct < floor - tol:
             status = "underweight"
         elif pos_pct > cap + tol:

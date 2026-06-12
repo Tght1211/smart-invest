@@ -129,6 +129,21 @@ def summarize_reviews(results):
     }
 
 
+def _order_instruction(a):
+    """P6: 可直接照抄执行的下单指令。"""
+    if a["action"] == "buy":
+        return (f"📋 照抄指令：在天天基金/支付宝搜索 {a['code']}，"
+                f"买入 ¥{a['suggested_amount']:.0f}")
+    if a["action"] == "sell":
+        return (f"📋 照抄指令：在持仓中找到 {a['code']}，"
+                f"卖出 {a['suggested_shares']:.2f} 份"
+                f"（约 ¥{a['suggested_amount']:.0f}）")
+    return None
+
+
+_ADVICE_ICON = {"underweight": "📉", "overweight": "📈", "in_band": "✅"}
+
+
 def _format_md(packet):
     lines = []
     lines.append(f"# 决策包 — 账户 {packet['account']} — {packet['date']}")
@@ -155,6 +170,18 @@ def _format_md(packet):
     if s["sectors"]:
         sec = " / ".join(f"{k} {v * 100:.0f}%" for k, v in s["sectors"].items())
         lines.append(f"**赛道分布**: {sec}")
+
+    adv = packet.get("portfolio_advice")
+    if adv:
+        lines.append("")
+        lines.append("## 📊 仓位概览")
+        lines.append(
+            f"{_ADVICE_ICON.get(adv['status'], '•')} "
+            f"仓位 **{adv['position_pct'] * 100:.0f}%** | 目标区间 "
+            f"{adv['target_floor'] * 100:.0f}%~{adv['position_cap'] * 100:.0f}% | "
+            f"可部署现金 ¥{adv['deployable_cash']:,.0f}"
+        )
+        lines.append(f"> {adv['advice_zh']}")
 
     if s["by_position"]:
         lines.append("")
@@ -200,6 +227,9 @@ def _format_md(packet):
                     f"- ⏸️  **{a['action']}** {a['name']} ({a['code']})"
                 )
             lines.append(f"  > {a['reason_zh']}")
+            instr = _order_instruction(a)
+            if instr:
+                lines.append(f"  > {instr}")
 
     if packet["blocked_actions"]:
         lines.append("")
@@ -336,6 +366,14 @@ def _format_brief(packet):
         f"💰 总 ¥{s['total_value']:,.0f} | 现金 {s['cash_pct']*100:.0f}% | "
         f"持仓 {s['position_pct']*100:.0f}%",
     ]
+    adv = packet.get("portfolio_advice")
+    if adv:
+        lines.append(
+            f"{_ADVICE_ICON.get(adv['status'], '•')} 仓位 "
+            f"{adv['position_pct']*100:.0f}% / 目标 "
+            f"{adv['target_floor']*100:.0f}%~{adv['position_cap']*100:.0f}% — "
+            f"{adv['advice_zh']}"
+        )
     sm = packet["summary"]
     counts = sm["action_count"]
     if any(counts.values()):
@@ -365,6 +403,9 @@ def _format_brief(packet):
             f"{sym} {top['rule_label']}: {top['name']} {detail} "
             f"(conf {top['confidence']:.2f})"
         )
+        instr = _order_instruction(top)
+        if instr:
+            lines.append(instr)
     if packet["alerts"]:
         lines.append(f"⚠️  {packet['alerts'][0]['reason_zh']}")
     return "\n".join(lines)

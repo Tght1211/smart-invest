@@ -186,6 +186,16 @@ def card_action(ctx, session, recorded, skipped=None):
         held_winner = any(a.get("rule_id") in TAKE_PROFIT_RULES for a in sells)
         if act:
             parts.append(prefix + "；".join(a["reason_zh"] for a in act))
+            instr = []
+            for a in act:
+                if a["action"] == "buy":
+                    instr.append(f"支付宝/天天基金搜 {a['code']} "
+                                 f"买入 ¥{a['suggested_amount']:,.0f}")
+                else:
+                    instr.append(f"卖出 {a['code']} "
+                                 f"{a.get('suggested_shares') or 0:,.0f} 份"
+                                 f"（约 ¥{a.get('suggested_amount') or 0:,.0f}）")
+            parts.append("📋 照抄指令：" + "；".join(instr) + "。")
         elif held_winner:
             parts.append(prefix + "已盈利，继续持有让利润奔跑，跌破止损再走。")
         else:
@@ -194,6 +204,25 @@ def card_action(ctx, session, recorded, skipped=None):
     if overnight:
         parts.append(overnight)
     return [":::action", " ".join(parts), ":::", ""]
+
+
+def card_position(ctx):
+    """P6: 总仓位概览 —— 每封日报都让用户看到仓位 vs 目标区间。"""
+    adv = ctx["packet"].get("portfolio_advice")
+    if not adv:
+        return []
+    icon = {"underweight": "📉", "overweight": "📈", "in_band": "✅"}.get(
+        adv["status"], "•")
+    return [
+        "### 📊 仓位概览", "",
+        f"{icon} 仓位 **{adv['position_pct'] * 100:.0f}%**"
+        f"（目标 {adv['target_floor'] * 100:.0f}%~"
+        f"{adv['position_cap'] * 100:.0f}%）| "
+        f"可部署现金 ¥{adv['deployable_cash']:,.0f}",
+        "",
+        f"> {adv['advice_zh']}",
+        "",
+    ]
 
 
 def card_holdings(ctx):
@@ -418,6 +447,7 @@ def assemble(db, ctx, session, recorded, skipped=None):
     md += card_top(ctx, session)
     md += card_spark(ctx)               # 纳指隔夜（QDII 当日方向）
     md += card_action(ctx, session, recorded, skipped)
+    md += card_position(ctx)
     md += card_holdings(ctx)
     md += card_holding_sparks(ctx)      # 每只持仓近30天净值走势
     md += card_blocks()
