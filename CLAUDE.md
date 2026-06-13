@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **Claude Code Skill** (not a standalone app). The user installs it by copying this directory to `~/.claude/skills/smart-invest/`, after which the skill is invoked from inside a Claude Code session. `SKILL.md` is the operational prompt loaded by Claude Code at runtime — it defines triggers, workflows, decision rules, and which CLI commands to call. The Python scripts in `scripts/` are the tools that prompt invokes.
 
-When editing this repo, you are editing **either** the runtime prompt (`SKILL.md`, `data/decision_tree.{md,json}`) **or** the Python tools the prompt calls (`scripts/*.py`). Keep the two in sync — if you rename a CLI subcommand or change its flags, also update `SKILL.md` (search for the command string).
+When editing this repo, you are editing **either** the runtime prompt (`SKILL.md`, `reference/*.md`, `data/decision_tree.{md,json}`) **or** the Python tools the prompt calls (`scripts/*.py`). Keep the two in sync — if you rename a CLI subcommand or change its flags, also update `SKILL.md` and `reference/*.md` (search for the command string).
+
+`SKILL.md` follows Anthropic's progressive-disclosure guidance: it's a lean navigable core (<500 lines) that links one level deep to `reference/` detail files loaded on demand — `reference/report-templates.md` (card DSL + three-session/evening/weekly/monthly report templates + 自主经营纪律), `reference/analysis-and-backtest.md` (single-fund/sector modes + 梦境 backtest/lab), `reference/rule-and-fund-reference.md` (rule-ID lookup + secid/fund-pool appendix). Heavy reference content goes in these files, not inline in SKILL.md.
 
 ## Architecture
 
