@@ -166,6 +166,27 @@ class Database:
         # 8. 操作复盘评定（"记忆"：每笔历史交易事后是否踩中）
         self._ensure_review_table(cursor)
 
+        # 9. 定投计划（P7）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS auto_invest_plans (
+                id INTEGER PRIMARY KEY,
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                amount REAL NOT NULL,
+                frequency TEXT NOT NULL,
+                day_field INTEGER,
+                anchor_date TEXT,
+                platform TEXT DEFAULT '支付宝',
+                enabled INTEGER DEFAULT 1,
+                note TEXT,
+                last_executed_date TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                UNIQUE(account_id, code)
+            )
+        """)
+
         # 创建索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_account ON positions(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_account ON trades(account_id)")
@@ -173,6 +194,7 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_account ON daily_snapshots(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_simulations_account ON simulation_runs(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_account ON trade_reviews(account_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dca_account ON auto_invest_plans(account_id)")
 
         self.conn.commit()
         print(f"[OK] 数据库已初始化: {self.db_path}")
@@ -353,6 +375,63 @@ class Database:
         else:
             row["win_rate"] = 0
         return row
+
+    # ========== 定投计划（P7）==========
+
+    def add_dca_plan(self, account_id, code, name, amount, frequency,
+                     day_field=None, anchor_date=None, platform="支付宝", note=None):
+        """新增/更新定投计划（按 account+code upsert）。"""
+        now = datetime.now().isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO auto_invest_plans
+                (account_id, code, name, amount, frequency, day_field, anchor_date,
+                 platform, enabled, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(account_id, code) DO UPDATE SET
+                name = excluded.name, amount = excluded.amount,
+                frequency = excluded.frequency, day_field = excluded.day_field,
+                anchor_date = excluded.anchor_date, platform = excluded.platform,
+                enabled = 1, note = excluded.note, updated_at = excluded.updated_at
+        """, (account_id, code, name, amount, frequency, day_field, anchor_date,
+              platform, note, now, now))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_dca_plans(self, account_id, enabled_only=True):
+        """返回账户的定投计划列表（dict）。"""
+        q = "SELECT * FROM auto_invest_plans WHERE account_id = ?"
+        params = [account_id]
+        if enabled_only:
+            q += " AND enabled = 1"
+        q += " ORDER BY code"
+        return [dict(r) for r in self.conn.execute(q, params).fetchall()]
+
+    def remove_dca_plan(self, account_id, code):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM auto_invest_plans WHERE account_id = ? AND code = ?",
+            (account_id, code))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def set_dca_enabled(self, account_id, code, enabled):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE auto_invest_plans SET enabled = ?, updated_at = ? "
+            "WHERE account_id = ? AND code = ?",
+            (1 if enabled else 0, datetime.now().isoformat(), account_id, code))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def set_dca_last_executed(self, account_id, code, date):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE auto_invest_plans SET last_executed_date = ?, updated_at = ? "
+            "WHERE account_id = ? AND code = ?",
+            (date, datetime.now().isoformat(), account_id, code))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     # ========== 快照操作 ==========
 
@@ -887,6 +966,86 @@ def cmd_cash(args):
     db.close()
 
 
+_FREQ_ZH = {"daily": "每日", "weekly": "每周", "biweekly": "每两周", "monthly": "每月"}
+_WEEKDAY_ZH = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
+
+
+def _dca_when_zh(plan):
+    f = plan["frequency"]
+    d = plan.get("day_field")
+    if f == "daily":
+        return "每日"
+    if f == "monthly":
+        return f"每月{d}号" if d else "每月"
+    if f in ("weekly", "biweekly"):
+        wd = _WEEKDAY_ZH.get(d, "?")
+        return ("每周" if f == "weekly" else "每两周") + wd
+    return _FREQ_ZH.get(f, f)
+
+
+def cmd_dca(args):
+    """定投计划管理：add / list / remove / toggle"""
+    db = Database()
+    try:
+        account = db.get_account(name=args.account)
+        if not account:
+            print(f"[ERROR] 账户不存在: {args.account}")
+            return
+        aid = account["id"]
+        sub = args.dca_command
+
+        if sub == "list":
+            plans = db.get_dca_plans(aid, enabled_only=False)
+            if not plans:
+                print(f"账户 {args.account} 暂无定投计划。")
+                return
+            print(f"\n账户 {args.account} 定投计划：")
+            print("-" * 72)
+            for p in plans:
+                flag = "✅" if p["enabled"] else "⏸️ 停用"
+                last = p.get("last_executed_date") or "—"
+                print(f"{flag} {p['code']} {p['name']}  ¥{p['amount']:,.0f} "
+                      f"{_dca_when_zh(p)}  [{p['platform']}]  上次执行 {last}")
+            print("-" * 72)
+
+        elif sub == "add":
+            freq = args.freq
+            if freq not in ("daily", "weekly", "biweekly", "monthly"):
+                print(f"[ERROR] freq 须为 daily/weekly/biweekly/monthly，得到: {freq}")
+                return
+            if freq == "monthly" and not (args.day and 1 <= args.day <= 31):
+                print("[ERROR] 每月定投需 --day 1-31")
+                return
+            if freq in ("weekly", "biweekly") and not (args.day and 1 <= args.day <= 5):
+                print("[ERROR] 每周/每两周定投需 --day 1-5（周一=1..周五=5，仅交易日）")
+                return
+            if freq == "biweekly" and not args.anchor:
+                print("[ERROR] 每两周定投需 --anchor YYYY-MM-DD 作单双周基准")
+                return
+            db.add_dca_plan(aid, args.code, args.name, args.amount, freq,
+                            day_field=args.day, anchor_date=args.anchor,
+                            platform=args.platform, note=args.note)
+            print(f"[OK] 定投已配置: {args.code} {args.name} ¥{args.amount:,.0f} "
+                  f"{_dca_when_zh({'frequency': freq, 'day_field': args.day})}")
+
+        elif sub == "remove":
+            if db.remove_dca_plan(aid, args.code):
+                print(f"[OK] 定投计划已删除: {args.code}")
+            else:
+                print(f"[WARN] 未找到定投计划: {args.code}")
+
+        elif sub == "toggle":
+            enabled = not args.off if (args.on or args.off) else False
+            if args.on:
+                enabled = True
+            if db.set_dca_enabled(aid, args.code, enabled):
+                print(f"[OK] 定投计划 {args.code} 已{'启用' if enabled else '停用'}")
+            else:
+                print(f"[WARN] 未找到定投计划: {args.code}")
+    finally:
+        db.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="数据库管理工具 — Smart Invest Skill")
     sub = parser.add_subparsers(dest="command")
@@ -946,6 +1105,37 @@ def main():
     p_cash.add_argument("--set", type=float, default=None, help="直接设置现金")
     p_cash.add_argument("--adjust", type=float, default=None, help="增减现金（可负）")
 
+    # 定投计划
+    p_dca = sub.add_parser("dca", help="定投计划管理")
+    dca_sub = p_dca.add_subparsers(dest="dca_command", required=True)
+
+    d_list = dca_sub.add_parser("list", help="列出定投计划")
+    d_list.add_argument("--account", "-a", required=True)
+
+    d_add = dca_sub.add_parser("add", help="新增/更新定投计划")
+    d_add.add_argument("--account", "-a", required=True)
+    d_add.add_argument("--code", "-c", required=True, help="基金代码")
+    d_add.add_argument("--name", "-n", required=True, help="基金名称")
+    d_add.add_argument("--amount", type=float, required=True, help="每期金额")
+    d_add.add_argument("--freq", required=True,
+                       help="周期: daily/weekly/biweekly/monthly")
+    d_add.add_argument("--day", type=int, default=None,
+                       help="月投=几号(1-31); 周/双周投=星期(周一=1..周日=7)")
+    d_add.add_argument("--anchor", default=None,
+                       help="双周投单双周基准日 YYYY-MM-DD")
+    d_add.add_argument("--platform", default="支付宝")
+    d_add.add_argument("--note", default=None)
+
+    d_rm = dca_sub.add_parser("remove", help="删除定投计划")
+    d_rm.add_argument("--account", "-a", required=True)
+    d_rm.add_argument("--code", "-c", required=True)
+
+    d_tog = dca_sub.add_parser("toggle", help="启用/停用定投计划")
+    d_tog.add_argument("--account", "-a", required=True)
+    d_tog.add_argument("--code", "-c", required=True)
+    d_tog.add_argument("--on", action="store_true", help="启用")
+    d_tog.add_argument("--off", action="store_true", help="停用")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -964,6 +1154,7 @@ def main():
         "remove-position": cmd_remove_position,
         "add-order": cmd_add_order,
         "cash": cmd_cash,
+        "dca": cmd_dca,
     }
 
     commands[args.command](args)

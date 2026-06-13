@@ -298,6 +298,21 @@ python3 scripts/send_email.py trade-notify \
 
 `--action buy` 或 `sell`。每笔买入/卖出操作完成后**必须立即发邮件**。
 
+### 4.5 定投计划（P7）
+
+用户在券商/支付宝开启的自动定投，配置进 DB 后引擎会感知：**定投基金不再出任何买入建议**（分批建仓/低吸/信号买入都跳过——累积已交给定投），卖出规则（止盈/止损/趋势退出）照常；盘尾(close)日报自动记账今日到期的定投（写交易+累加持仓+扣现金+发通知，按周期幂等去重）。
+
+```bash
+# 配置（freq: daily/weekly/biweekly/monthly；月投 --day 1-31；周/双周投 --day 1-5(周一=1)；双周投需 --anchor）
+python3 scripts/db.py dca add --account 主线 --code 006479 --name "广发纳斯达克100ETF联接C" --amount 10 --freq daily
+python3 scripts/db.py dca add --account 主线 --code 161725 --name "招商中证白酒指数A" --amount 500 --freq monthly --day 5
+python3 scripts/db.py dca list   --account 主线
+python3 scripts/db.py dca toggle --account 主线 --code 161725 --off   # 暂停
+python3 scripts/db.py dca remove --account 主线 --code 161725
+```
+
+用户说"我 XX 基金开了定投，每月/每周投 X 元"时，用 `dca add` 配置即可。`portfolio_advice` 会在仓位概览里注明"含定投自动投入"。
+
 ---
 
 ## 五、报告 Markdown 模板

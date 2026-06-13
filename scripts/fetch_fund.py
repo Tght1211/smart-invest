@@ -1420,6 +1420,12 @@ def gather_market_snapshot(account_name="主线", date=None):
         except Exception:
             review_summary = {"count": 0}
 
+        # P7: 定投基金代码（引擎据此不出买入建议）
+        try:
+            dca_codes = [p["code"] for p in db.get_dca_plans(account_id)]
+        except Exception:
+            dca_codes = []
+
         return {
             "hs300_5d_return": hs300_5d,
             "hs300_20d_return": hs300_20d,
@@ -1429,6 +1435,7 @@ def gather_market_snapshot(account_name="主线", date=None):
             "index_trend": index_trend,
             "news": news,
             "recent_review_summary": review_summary,
+            "auto_invest_codes": dca_codes,
         }
     finally:
         db.close()

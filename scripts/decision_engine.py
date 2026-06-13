@@ -129,6 +129,9 @@ class DecisionEngine:
         ).fetchone()
         account_name = row["name"] if row else "unknown"
 
+        # P7: 定投基金代码集（已委托自动定投，引擎不再出买入建议；卖出照常）
+        self._dca_codes = set(market_data.get("auto_invest_codes") or [])
+
         regime = self._compute_market_regime(market_data)
         snapshot = self._compute_portfolio_snapshot(
             positions, market_data, cash, total_value,
@@ -755,9 +758,12 @@ class DecisionEngine:
 
         fc = self.rules.get("fund_constraints") or {}
         cands = []
+        dca_codes = getattr(self, "_dca_codes", set())
         for code, fund in funds.items():
             if code in buy_codes or code in positions_with_sell:
                 continue
+            if code in dca_codes:
+                continue  # P7: 定投基金交给定投累积，不占建仓名额
             existing = any(p["code"] == code for p in positions)
             ok, _ = self._check_market_allows_buy(regime, existing)
             if not ok:
@@ -902,6 +908,9 @@ class DecisionEngine:
                 f"当前仓位 {pos_pct * 100:.0f}% 在{label}目标区间 "
                 f"{floor * 100:.0f}%~{cap * 100:.0f}% 内，维持节奏。"
             )
+        # P7: 有定投时补一句——仓位会随定投自然提升，引擎不再对这些基金给买入建议
+        if getattr(self, "_dca_codes", None):
+            advice += "（含定投自动投入，相关基金仓位会随定投自然提升）"
         return {
             "position_pct": round(pos_pct, 4),
             "target_floor": floor,
@@ -1018,9 +1027,12 @@ class DecisionEngine:
         # Pass 2: buys on each candidate fund (skip if sell already triggered)
         # 优先级: low_buy > rsi_oversold_buy > momentum_breakout（每基金每日至多一条买入）
         buy_codes = set()
+        dca_codes = getattr(self, "_dca_codes", set())
         for code, fund in funds.items():
             if code in positions_with_sell:
                 continue
+            if code in dca_codes:
+                continue  # P7: 已委托定投，引擎不出买入建议（卖出已在上方处理）
             action, block = self._try_low_buy(
                 code, fund, snapshot, regime, cash, total_value,
             )

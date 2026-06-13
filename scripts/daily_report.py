@@ -489,7 +489,13 @@ def main():
 
         recorded, skipped = [], []
         if args.session == "close" and not args.no_record:
+            # P7: 先记账今日到期的定投（写交易+累加持仓+扣现金+通知）
+            import auto_invest
+            dca_done = auto_invest.record_due_plans(
+                db, ctx["account_id"], args.account, datetime.now().date(),
+                ctx["funds"], do_email=not args.no_email)
             recorded, skipped = auto_record(db, ctx, args.account, do_email=not args.no_email)
+            recorded = dca_done + recorded
 
         md = assemble(db, ctx, args.session, recorded, skipped)
         if args.print:
