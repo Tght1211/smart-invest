@@ -57,6 +57,24 @@ QDII_INDEX_MAP = {
 }
 
 
+def fund_venue(code, name):
+    """判断基金交易场所：场内(需证券账户) vs 场外(支付宝可直接申购)。
+
+    用户只用支付宝，只能买场外基金。判定规则（以名称为准，最可靠）：
+    - 纯 ETF（名称含 "ETF" 但不含 "联接"）= 场内，需开证券账户，支付宝买不了。
+    - ETF联接 / LOF / 普通指数 / 股票 / 混合 / QDII联接 = 场外，支付宝可直接申购。
+    LOF（如 161725 招商白酒）是双渠道，支付宝可买，按场外处理。
+    """
+    nm = name or ""
+    is_pure_etf = ("ETF" in nm.upper()) and ("联接" not in nm)
+    return "场内" if is_pure_etf else "场外"
+
+
+def is_otc(code, name):
+    """是否场外（支付宝可直接申购）"""
+    return fund_venue(code, name) == "场外"
+
+
 def _get(url, headers=None, retries=2):
     """通用 HTTP GET 请求，带重试"""
     req_headers = dict(HEADERS)
@@ -511,20 +529,28 @@ def cmd_rank(args):
     field_index_map = {"jnzf": 14, "1nzf": 11, "6nzf": 10, "3nzf": 13, "2nzf": 12, "1yzf": 7, "1yzf": 8}
     field_idx = field_index_map.get(sc, 10)
 
-    print(f"\n基金排行 ({type_name} · {period_name}) Top {top}:")
-    print(f"{'排名':>4} {'代码':<8} {'名称':<24} {'最新净值':>8} {'日期':<12} {'区间涨幅':>10}")
-    print("-" * 75)
+    otc_only = getattr(args, "otc_only", False)
+    suffix = "（仅场外·支付宝可买）" if otc_only else ""
+    print(f"\n基金排行 ({type_name} · {period_name}) Top {top}{suffix}:")
+    print(f"{'排名':>4} {'代码':<8} {'名称':<24} {'场所':<5} {'最新净值':>8} {'日期':<12} {'区间涨幅':>10}")
+    print("-" * 82)
 
-    for i, item in enumerate(items, 1):
+    rank_no = 0
+    for item in items:
         fields = item.split(",")
         if len(fields) < 5:
             continue
         code = fields[0]
         name = fields[1]
+        venue = fund_venue(code, name)
+        # --otc-only：过滤掉场内 ETF（用户走支付宝买不了）
+        if otc_only and venue == "场内":
+            continue
+        rank_no += 1
         date = fields[3] if len(fields) > 3 else ""
         nav = fields[4] if len(fields) > 4 else ""
         zzf = fields[field_idx] if len(fields) > field_idx and fields[field_idx] else "--"
-        print(f"{i:>4} {code:<8} {name:<24} {nav:>8} {date:<12} {zzf:>9}%")
+        print(f"{rank_no:>4} {code:<8} {name:<24} {venue:<5} {nav:>8} {date:<12} {zzf:>9}%")
 
 
 def cmd_index_kline(args):
@@ -1065,6 +1091,7 @@ def main():
     p_rank.add_argument("--type", default="all", choices=["gp", "hh", "zj", "zs", "qdii", "all"], help="基金类型")
     p_rank.add_argument("--period", default="1n", choices=["jn", "1n", "6n", "2n", "3n"], help="统计区间")
     p_rank.add_argument("--top", type=int, default=20, help="排名数量（默认20）")
+    p_rank.add_argument("--otc-only", action="store_true", help="只显示场外(支付宝可买)基金，过滤场内ETF")
 
     # index-kline
     p_kline = sub.add_parser("index-kline", help="获取指数历史K线")
