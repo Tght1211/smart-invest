@@ -40,6 +40,8 @@ $ARGUMENTS
 | "查看持仓"/"我的基金"/"持仓情况" | 查持仓 | ❌ | ❌ |
 | "买了 XXX"/"加仓"/"减仓"/"卖了" | 记交易 | ✅ 交易通知 | ✅ |
 | "梦境训练"/"回测"/"用过去 N 个月模拟" | E 回测 | ❌ | ❌ |
+| "复盘"/"评定操作"/"之前买得对不对"/"踩中了吗"/"卖飞了吗" | F 复盘 | ❌ | ❌ |
+| "收益变化"/"持有多久了"/"单只走势"/"赚了多少" | 查持仓+收益 | ❌ | ❌ |
 | "基金排行"/"推荐基金" | 发现 | ❌ | ❌ |
 | 09:30 cron 定时触发 | A 开盘卡片 | ✅ | ✅ |
 | 13:00 cron 定时触发 | A 盘中卡片 | ✅ | ✅ |
@@ -83,11 +85,14 @@ python3 scripts/decide.py run --account 主线 --format json
 对所有分析模式（A/B/D），先调引擎：
 
 ```
-1. python3 scripts/decide.py run --account 主线 --format json
-2. 阅读决策包：market_regime / portfolio_snapshot / actions / blocked / alerts
-3. 按 §五 报告模板，把决策包翻译成中文报告（保留 reason_zh 原文）
-4. WebSearch 补当日市场新闻（仅模式 A/D）
-5. 如属模式 A 或交易：发邮件 + 桌面通知
+1. python3 scripts/decide.py run --account 主线 --format json   # 引擎决策（实盘权威）
+2. python3 scripts/fetch_fund.py tech --account 主线            # 技术/波动面板（报告层加权，见 §2.5）
+3. 阅读决策包：market_regime / portfolio_snapshot / actions / blocked / alerts
+4. 补当日新闻喂 §2.5 加权（仅模式 A/D）：交互会话优先用 WebSearch（更丰富）；
+   要确定性/无 LLM 时用 `python3 scripts/fetch_fund.py news [--keyword 半导体]`（免费 7x24 快讯）
+5. python3 scripts/decide.py review --account 主线 --summary    # 读「操作复盘记忆」（§2.6），并入宏观判断
+6. 按 §五 报告模板把决策包翻成中文，叠加「技术/波动面 + 新闻 + 近期操作复盘」一段解读
+7. 如属模式 A 或交易：发邮件 + 桌面通知
 ```
 
 模式 C（单只基金）不需要走引擎，直接用 `fetch_fund.py estimate <code>` + `nav <code> --days 60` 给出趋势分析即可。
@@ -154,6 +159,36 @@ python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 500
 - ❌ 不要自己计算"现金 <10% 不能买"等阈值 — 引擎已经做过。
 - ❌ 不要自己判断"震荡市/熊市"——读 `market_regime.label`。
 
+### 2.5 技术/波动/新闻 加权（报告层，不改引擎决策）
+
+`fetch_fund.py tech <code>|--account 主线` 给出每只基金的**近期/历史**面板：动量（近1月/3月）、波动率（60日年化）、最大回撤、趋势（MA20/MA60 方向、突破20日新高）、RSI/MACD。**这是报告层的加权材料，不驱动引擎买卖**——决策权威仍是 `decide.py`。
+
+**怎么用（每次分析必做）**：
+
+1. **解读叠加报告**：在中文报告里加一段"技术/波动面"，把面板翻成人话（如"中期 MA60 上行但短期 MA20 回踩、RSI 中性、波动率 23%偏温和、近60日最大回撤 -7%"）+ 当日新闻催化。
+2. **加权我的建议口径**——引擎给方向，技术/波动/新闻调"力度与时机"：
+   - 趋势同向 + 动量强 + 突破新高 → 顺势，可在引擎建议上**更积极**（追涨也要按铁律给逻辑+止损）。
+   - 高波动（年化 >35%）或临近历史大回撤位 → **缩小金额/分散**，提示风险。
+   - RSI <30 超卖 + 当日跌 → 低吸更有据；RSI >70 超买 → 不追高。
+   - 新闻有重大利空/政策转向 → 在报告显著提示，必要时建议比引擎更保守。
+3. **冲突处理**：技术/新闻与引擎**矛盾时，引擎决策仍执行**（尤其止损/风控这种硬闸门不可被"我觉得会反弹"覆盖），但**在报告里明确写出分歧和理由**，让用户知情自己决定。技术面只能让我"更谨慎"或"在允许范围内更积极"，**不能凭它绕过引擎的卖出/拦截**。
+4. **务必有据有原因**（同 ⛔ 铁律 #3）：每一句技术/新闻加权都要落到"所以建议怎样、为什么"。
+
+### 2.6 操作复盘与记忆（决策回看，喂宏观判断）
+
+**思路**：拿"事后 N 天的净值"回看当初那笔买/卖是否**正确踩中**——买入后涨=踩中、跌=追高套牢；卖出后跌=规避下跌、涨=卖飞。评定结果**写进 `trade_reviews` 表当记忆**，下次分析时一起读，形成"我过去买卖择时准不准"的宏观自省。这是**报告层**能力，不改引擎决策。
+
+```bash
+python3 scripts/decide.py review --account 主线 --horizon 7 --lookback 60 --save   # 复盘并写入记忆
+python3 scripts/decide.py review --account 主线 --summary                          # 只读已存记忆的宏观总结
+python3 scripts/db.py reviews --account 主线                                       # 表格回看每笔评定
+```
+
+- `--horizon`：事后回看多少天（默认 7≈一周）；`--lookback`：复盘最近多少天内的操作（默认 60）。
+- 只评定"够年龄"（满 horizon 天）的操作，太新的列为待观察。每笔产出 **评定（踩中/追高套牢/规避下跌/卖飞/中性）+ 分数 + 一句教训**，并给出**买入/卖出择时胜率**。
+- **怎么用**：报告里用人话点评近期操作（"回看 06/15 买入半导体ETF，事后一周 +11%，**精准踩中**；06/06 卖出中证 500 后又涨 8%，**卖飞了，下次趋势没走完别急着减**"），并让宏观胜率影响语气——若买入择时胜率低，追涨时更谨慎。
+- `daily_report.py` 盘尾卡片会**自动**跑一次 `--save`（幂等），把复盘点评渲染进「近期操作 & 复盘」时间线，记忆持续累积。
+
 ---
 
 ## 三、首次使用引导（重要）
@@ -194,13 +229,21 @@ python3 scripts/send_email.py check
 
 **⚠️ 所有写操作必须通过 `db.py` CLI，禁止用 Read/Write/Edit 直接改 `portfolio.json` / `orders.json`。**
 
-### 4.1 查持仓 / 订单
+### 4.1 查持仓 / 订单 / 收益变化 / 复盘
 
 ```bash
 python3 scripts/db.py positions --account 主线
 python3 scripts/db.py trades    --account 主线 --limit 50
-python3 scripts/fetch_fund.py portfolio-check --account 主线   # 带实时估值
+python3 scripts/fetch_fund.py portfolio-check --account 主线   # 实时估值（已含「持有天数」列）
+python3 scripts/fetch_fund.py portfolio-show  --account 主线   # 静态持仓（含「持有天数」列）
+python3 scripts/fetch_fund.py returns --account 主线 --days 30 # 单只 + 组合「收益变化」趋势（含迷你走势）
+python3 scripts/fetch_fund.py returns --account 主线 --code 006479 --days 60  # 只看单只
+python3 scripts/db.py reviews --account 主线                   # 历史操作复盘评定（记忆，见 §2.6）
+python3 scripts/fetch_fund.py news --keyword 半导体            # 免费财经快讯（见 §2.5）
 ```
+
+- **持有天数** = 买入日期到今天的自然日，`portfolio-check/show` 与盘尾卡片持仓表都已展示。
+- **收益变化**：`returns` 给每只基金的"较 N 天前 Δ"+迷你走势，和组合总收益率的时间序列（净值派生，不依赖快照）。
 
 ### 4.2 买入 / 加仓（4 步）
 
@@ -272,12 +315,12 @@ python3 scripts/send_email.py trade-notify \
 :::
 ```
 
-**③ 持仓表格** — 表头固定 6 列。`今日`=当日估算%，`今日盈亏/昨日盈亏`=金额，`累计`=持有总收益%，`持有`=当前市值
+**③ 持仓表格** — 表头 6~7 列。`今日`=当日估算%，`今日盈亏/昨日盈亏`=金额，`累计`=持有总收益%，`持有`=当前市值，**第 7 列 `天数`=持有天数（可选）**。渲染成"市值 ¥X · 持有 N 天"。
 
 ```
-| 基金 | 今日 | 今日盈亏 | 昨日盈亏 | 累计 | 持有 |
-|------|------|---------|---------|------|------|
-| 广发纳斯达克100C | -0.09% | -13.12 | +329.93 | +26.15% | 14,861 |
+| 基金 | 今日 | 今日盈亏 | 昨日盈亏 | 累计 | 持有 | 天数 |
+|------|------|---------|---------|------|------|------|
+| 广发纳斯达克100C | -0.09% | -13.12 | +329.93 | +26.15% | 14,861 | 8天 |
 ```
 
 **④ 大盘热力块 `:::blocks`** — 每行"名称 +X%"，渲染器自动按涨跌着色分层
@@ -341,7 +384,10 @@ python3 scripts/send_email.py trade-notify \
 ```bash
 python3 scripts/daily_report.py --session open|mid|close --account 主线
 #   --no-record 只提示不记账   --no-email 只生成   --print 打到 stdout
+#   --html [路径]  渲染邮件 HTML 到文件供浏览器预览（不发信），省略路径写 reports/preview-<session>-<date>.html
 ```
+
+卡片除了顶部数字/黄框/持仓表/大盘热力块，还**自动渲染**：① 每只持仓近 30 天净值**迷你走势图**（`:::spark`，不只纳指）；② 持仓表带**持有天数**；③ **财经要闻** 3 条（免费 7x24 快讯）；④ **「近期操作 & 复盘」时间线**——每笔标"精准踩中 ✅／卖飞了 ❗（事后±x%）"+ 买卖择时胜率（顺手 `review --save` 累积记忆，见 §2.6）。
 
 盘尾默认自动记账，但有护栏：**止盈跳过（让利润奔跑）、止损执行、QDII 加仓跳过、同规则 7 天去重**（防 runaway 重复减仓）。
 
@@ -471,9 +517,10 @@ python3 scripts/send_email.py send \
 ```bash
 python3 scripts/fetch_fund.py estimate <code>
 python3 scripts/fetch_fund.py nav <code> --days 60
+python3 scripts/fetch_fund.py tech <code>      # 波动/回撤/趋势/RSI/动量（§2.5 加权）
 ```
 
-输出：
+输出（须含技术/波动面解读 + 当日新闻，按 §2.5 加权给结论）：
 
 ```markdown
 ## 基金分析: {名称} ({code})
@@ -506,8 +553,18 @@ python3 scripts/fetch_fund.py rank --type zs --period 6n --top 20 --otc-only
 
 1. **只从场外候选里选**——`rank` 一律带 `--otc-only`，输出「场所」列全是「场外」才可推；**任何场内纯 ETF 一律不进推荐名单**。手上某个心仪代码先用 `fund_venue(code,name)` 验明场外再说。
 2. **追涨须有据**——选出的候选若已大涨，不一刀切禁买，但**推荐买入必须带逻辑 + 风险标注 + 止损打算**（见「⛔ 推荐铁律」第 2 条）；纯追高接盘则避免。逻辑不足时给"等回调 >3% 低吸"作为更稳的备选，但不强制。
-3. WebSearch 行业政策/动态补叙事。
-4. 给出 2-3 个该方向**场外**代表基金 + 仓位建议，**每只都写明推荐理由**（为什么是它、当前估值/趋势/排名依据）和"今天能不能买"的结论。
+3. **技术/波动加权**——对选出的 2-3 只候选逐个跑 `python3 scripts/fetch_fund.py tech <code>`，按 §2.5 把动量/波动/趋势/RSI 纳入"力度与时机"判断。
+4. WebSearch 行业政策/动态/催化补叙事，并入 §2.5 加权。
+5. 给出 2-3 个该方向**场外**代表基金 + 仓位建议，**每只都写明推荐理由**（为什么是它、估值/趋势/波动/排名依据 + 新闻催化）和"今天能不能买"的结论。
+
+### 6.3 操作复盘（模式 F）
+
+用户说"复盘 / 评定一下之前的操作 / 之前买得对不对 / 卖飞了吗"时：
+
+1. `python3 scripts/decide.py review --account 主线 --save`（见 §2.6）。
+2. 把输出的逐笔评定翻成人话点评——**踩中的夸一句、踏错的给改进动作**（如"追高套牢 → 下次等回调或趋势确认再进"、"卖飞 → 趋势没走完别急减"）。
+3. 报一句宏观：买入/卖出择时胜率，以及它对当前操作风格的提醒。
+4. 不发邮件、不通知（纯对话回看）。
 
 ---
 

@@ -10,7 +10,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -163,12 +163,16 @@ class Database:
             )
         """)
 
+        # 8. 操作复盘评定（"记忆"：每笔历史交易事后是否踩中）
+        self._ensure_review_table(cursor)
+
         # 创建索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_account ON positions(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_account ON trades(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_account ON daily_snapshots(account_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_simulations_account ON simulation_runs(account_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_account ON trade_reviews(account_id)")
 
         self.conn.commit()
         print(f"[OK] 数据库已初始化: {self.db_path}")
@@ -490,6 +494,115 @@ class Database:
         cursor.execute("SELECT * FROM simulation_runs ORDER BY created_at DESC")
         return [dict(row) for row in cursor.fetchall()]
 
+    # ========== 操作复盘评定（记忆） ==========
+
+    def _ensure_review_table(self, cursor=None):
+        """建 trade_reviews 表（幂等）。老库无需重跑 init 也能自愈。"""
+        c = cursor or self.conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trade_reviews (
+                id INTEGER PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                trade_id INTEGER,
+                code TEXT,
+                name TEXT,
+                action TEXT,
+                trade_date TEXT,
+                horizon_days INTEGER,
+                nav_at_trade REAL,
+                nav_after REAL,
+                nav_after_date TEXT,
+                post_return_pct REAL,
+                verdict TEXT,
+                score REAL,
+                lesson TEXT,
+                market_context TEXT,
+                reviewed_at TEXT,
+                UNIQUE(trade_id, horizon_days)
+            )
+        """)
+        if cursor is None:
+            self.conn.commit()
+
+    def add_trade_review(self, account_id, trade_id, code, name, action, trade_date,
+                         horizon_days, nav_at_trade, nav_after, nav_after_date,
+                         post_return_pct, verdict, score, lesson=None, market_context=None):
+        """写入/更新一笔操作复盘（按 trade_id + horizon 去重 upsert）。"""
+        self._ensure_review_table()
+        now = datetime.now().isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO trade_reviews
+                (account_id, trade_id, code, name, action, trade_date, horizon_days,
+                 nav_at_trade, nav_after, nav_after_date, post_return_pct,
+                 verdict, score, lesson, market_context, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_id, horizon_days) DO UPDATE SET
+                nav_after = excluded.nav_after,
+                nav_after_date = excluded.nav_after_date,
+                post_return_pct = excluded.post_return_pct,
+                verdict = excluded.verdict,
+                score = excluded.score,
+                lesson = excluded.lesson,
+                market_context = excluded.market_context,
+                reviewed_at = excluded.reviewed_at
+        """, (account_id, trade_id, code, name, action, trade_date, horizon_days,
+              nav_at_trade, nav_after, nav_after_date, post_return_pct,
+              verdict, score, lesson, market_context, now))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_trade_reviews(self, account_id, code=None, limit=None):
+        """取已存复盘记录（按交易日倒序）。"""
+        self._ensure_review_table()
+        cursor = self.conn.cursor()
+        query = "SELECT * FROM trade_reviews WHERE account_id = ?"
+        params = [account_id]
+        if code:
+            query += " AND code = ?"
+            params.append(code)
+        query += " ORDER BY trade_date DESC, id DESC"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_review_summary(self, account_id, lookback_days=None):
+        """聚合复盘：买/卖择时胜率、各结论计数、均分、近期教训。"""
+        rows = self.get_trade_reviews(account_id)
+        if lookback_days:
+            cutoff = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
+            rows = [r for r in rows if (r.get("trade_date") or "") >= cutoff]
+        if not rows:
+            return {"count": 0}
+
+        def _winrate(items):
+            scored = [r for r in items if r.get("score") is not None]
+            if not scored:
+                return None
+            wins = sum(1 for r in scored if r["score"] > 0)
+            return round(wins / len(scored), 4)
+
+        buys = [r for r in rows if r.get("action") == "buy"]
+        sells = [r for r in rows if r.get("action") == "sell"]
+        verdict_counts = {}
+        for r in rows:
+            v = r.get("verdict") or "未知"
+            verdict_counts[v] = verdict_counts.get(v, 0) + 1
+        scores = [r["score"] for r in rows if r.get("score") is not None]
+        lessons = [r["lesson"] for r in rows[:5] if r.get("lesson")]
+        return {
+            "count": len(rows),
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "buy_timing_winrate": _winrate(buys),
+            "sell_timing_winrate": _winrate(sells),
+            "overall_winrate": _winrate(rows),
+            "avg_score": round(sum(scores) / len(scores), 4) if scores else None,
+            "verdict_counts": verdict_counts,
+            "recent_lessons": lessons,
+        }
+
 
 # ========== CLI ==========
 
@@ -567,6 +680,50 @@ def cmd_trades(args):
         print(f"{t['date']:<12} {t['code']:<10} {t['name']:<25} {action_cn:<6} "
               f"¥{t['amount']:>10,.2f} {nav_str} {rule_str:<20}")
     print(f"{'='*120}\n")
+    db.close()
+
+
+def cmd_reviews(args):
+    """查看操作复盘评定（记忆）"""
+    db = Database()
+    account = db.get_account(name=args.account)
+    if not account:
+        print(f"[ERROR] 账户不存在: {args.account}")
+        return
+
+    reviews = db.get_trade_reviews(account["id"], limit=args.limit)
+    if not reviews:
+        print(f"账户 {args.account} 暂无复盘记录（先跑 decide.py review --save）")
+        db.close()
+        return
+
+    print(f"\n账户: {args.account} - 操作复盘评定 ({len(reviews)} 条)")
+    print(f"{'='*104}")
+    print(f"{'交易日':<12} {'方向':<6} {'名称':<22} {'视界':>5} {'事后涨跌':>9} {'评定':<10} {'分':>6}")
+    print(f"{'='*104}")
+    for r in reviews:
+        action_cn = "买入" if r["action"] == "buy" else "卖出"
+        pr = r.get("post_return_pct")
+        pr_str = f"{pr*100:+.2f}%" if pr is not None else "--"
+        sc = r.get("score")
+        sc_str = f"{sc:+.2f}" if sc is not None else "--"
+        print(f"{r.get('trade_date',''):<12} {action_cn:<6} {(r.get('name') or '')[:22]:<22} "
+              f"{str(r.get('horizon_days',''))+'d':>5} {pr_str:>9} {(r.get('verdict') or ''):<10} {sc_str:>6}")
+    print(f"{'='*104}")
+
+    summary = db.get_review_summary(account["id"])
+    if summary.get("count"):
+        bw = summary.get("buy_timing_winrate")
+        sw = summary.get("sell_timing_winrate")
+        bw_str = f"{bw*100:.0f}%" if bw is not None else "—"
+        sw_str = f"{sw*100:.0f}%" if sw is not None else "—"
+        print(f"宏观: 买入择时胜率 {bw_str}（{summary.get('buy_count',0)}笔） | "
+              f"卖出择时胜率 {sw_str}（{summary.get('sell_count',0)}笔） | "
+              f"均分 {summary.get('avg_score')}")
+        vc = summary.get("verdict_counts") or {}
+        if vc:
+            print("  分布: " + " ".join(f"{k}×{v}" for k, v in vc.items()))
+    print()
     db.close()
 
 
@@ -720,6 +877,10 @@ def main():
     p_trades.add_argument("--account", "-a", required=True, help="账户名称")
     p_trades.add_argument("--limit", "-l", type=int, default=50, help="显示条数")
 
+    p_reviews = sub.add_parser("reviews", help="查看操作复盘评定（记忆）")
+    p_reviews.add_argument("--account", "-a", required=True, help="账户名称")
+    p_reviews.add_argument("--limit", "-l", type=int, default=30, help="显示条数")
+
     sub.add_parser("tree-versions", help="查看决策树版本")
     sub.add_parser("evolutions", help="查看进化历史")
 
@@ -762,6 +923,7 @@ def main():
         "accounts": cmd_accounts,
         "positions": cmd_positions,
         "trades": cmd_trades,
+        "reviews": cmd_reviews,
         "tree-versions": cmd_tree_versions,
         "evolutions": cmd_evolutions,
         "import-json": cmd_import_json,

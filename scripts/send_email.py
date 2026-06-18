@@ -370,6 +370,7 @@ def markdown_to_html(md_text):
                 continue
             name = _md(cells[0]) if cells else ""
             today = cells[1] if len(cells) > 1 else ""
+            held = cells[6].strip() if len(cells) > 6 else ""   # 持有天数（可选第7列）
             if len(cells) >= 6:
                 today_pnl = cells[2]
                 yest_pnl = cells[3]
@@ -397,8 +398,10 @@ def markdown_to_html(md_text):
                 f'<td style="vertical-align:middle;">'
                 f'<p style="margin:0;font-size:16px;font-weight:500;color:#222222;">{name}</p>'
                 f'<p style="margin:4px 0 0;font-size:12px;color:{GRAY};">'
-                f'持有 &#165;{val}'
+                f'市值 &#165;{val}'
             )
+            if held:
+                parts.append(f'&nbsp;&nbsp;持有 {held}')
             if today_pnl.strip():
                 parts.append(
                     f'&nbsp;&nbsp;今日 <span style="color:{pnl_color};font-weight:600;">{_md(today_pnl)}</span>'

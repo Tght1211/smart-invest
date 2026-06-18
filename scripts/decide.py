@@ -18,15 +18,115 @@ import argparse
 import json
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from db import Database  # noqa: E402
-from decision_engine import DecisionEngine  # noqa: E402
+from decision_engine import DecisionEngine, evaluate_trade_timing  # noqa: E402
 import fetch_fund  # noqa: E402
+
+
+# 操作复盘评定结论 → 邮件/终端用的醒目短标签（满足"精准踩中 / 卖飞了"语感）
+VERDICT_BADGE = {
+    "踩中": "精准踩中 ✅",
+    "追高套牢": "追高套牢 ⚠️",
+    "规避下跌": "成功规避 ✅",
+    "卖飞": "卖飞了 ❗",
+    "中性": "影响有限 ◽",
+    "数据缺失": "数据缺失 ·",
+}
+
+
+def build_trade_reviews(db, account_id, horizon=7, lookback=60, save=False):
+    """复盘账户近 lookback 天、已满 horizon 天的历史操作（决定 + daily_report 共用）。
+
+    用 trades.nav 作买入/卖出当时净值，事后 horizon 天的净值判定择时是否踩中。
+    返回 (results, pending)：results 每条含 evaluate_trade_timing 字段 + 交易元数据；
+    pending = 太新、还不够 horizon 天、暂不评定的笔数。save=True 时写入 trade_reviews（记忆）。
+    """
+    today = datetime.now().date()
+    cutoff = (today - timedelta(days=lookback)).isoformat()
+    trades = [t for t in db.get_trades(account_id) if (t.get("date") or "") >= cutoff]
+
+    ready, pending = [], 0
+    for t in trades:
+        try:
+            td = datetime.strptime(str(t["date"])[:10], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if (today - td).days >= horizon:
+            ready.append((t, td))
+        else:
+            pending += 1
+    if not ready:
+        return [], pending
+
+    # 每个代码只拉一次净值序列（覆盖最老交易 → 今天 + horizon）
+    oldest_by_code = {}
+    for t, td in ready:
+        c = t["code"]
+        oldest_by_code[c] = min(td, oldest_by_code.get(c, td))
+    series_by_code = {}
+    for code, oldest in oldest_by_code.items():
+        days_needed = (today - oldest).days + horizon + 8
+        series_by_code[code] = fetch_fund.fetch_nav_series(code, days=min(days_needed, 400))
+
+    results = []
+    for t, td in ready:
+        series = series_by_code.get(t["code"]) or []
+        target = (td + timedelta(days=horizon)).isoformat()
+        nav_after = nav_after_date = None
+        for d, nav in series:  # 升序：取交易后 horizon 天首个可用净值
+            if d >= target:
+                nav_after, nav_after_date = nav, d
+                break
+        nav_at = t.get("nav")
+        if not nav_at and series:
+            for d, nav in reversed(series):
+                if d <= str(t["date"])[:10]:
+                    nav_at = nav
+                    break
+        ev = evaluate_trade_timing(t["action"], nav_at, nav_after, horizon_days=horizon)
+        out = {
+            "trade_id": t.get("id"), "date": str(t["date"])[:10],
+            "code": t["code"], "name": t["name"], "action": t["action"],
+            "amount": t.get("amount"), "nav_at_trade": nav_at,
+            "nav_after": nav_after, "nav_after_date": nav_after_date,
+            "badge": VERDICT_BADGE.get(ev["verdict"], ev["verdict"]),
+            **ev,
+        }
+        results.append(out)
+        if save and ev["score"] is not None:
+            db.add_trade_review(
+                account_id, t.get("id"), t["code"], t["name"], t["action"],
+                out["date"], horizon, nav_at, nav_after, nav_after_date,
+                ev["post_return_pct"], ev["verdict"], ev["score"], ev["lesson"])
+    return results, pending
+
+
+def summarize_reviews(results):
+    """从 build_trade_reviews 的 results 现算宏观总结（无需读库）。"""
+    scored = [r for r in results if r.get("score") is not None]
+    if not scored:
+        return {"count": 0}
+
+    def _wr(items):
+        s = [r for r in items if r.get("score") is not None]
+        if not s:
+            return None
+        return round(sum(1 for r in s if r["score"] > 0) / len(s), 4)
+
+    buys = [r for r in scored if r["action"] == "buy"]
+    sells = [r for r in scored if r["action"] == "sell"]
+    return {
+        "count": len(scored),
+        "buy_count": len(buys), "sell_count": len(sells),
+        "buy_timing_winrate": _wr(buys), "sell_timing_winrate": _wr(sells),
+        "avg_score": round(sum(r["score"] for r in scored) / len(scored), 4),
+    }
 
 
 def _format_md(packet):
@@ -520,6 +620,82 @@ def cmd_evolve(args):
         db.close()
 
 
+def cmd_review(args):
+    """复盘历史操作：事后 N 天净值判断当初买卖是否踩中，--save 写入记忆。"""
+    db = Database()
+    try:
+        row = db.conn.execute(
+            "SELECT id FROM accounts WHERE name = ?", (args.account,)
+        ).fetchone()
+        if not row:
+            print(f"[ERROR] account '{args.account}' not found", file=sys.stderr)
+            return 2
+        account_id = row["id"]
+
+        # --summary：只读已存评定（记忆）
+        if args.summary:
+            summary = db.get_review_summary(account_id, lookback_days=args.lookback)
+            if args.format == "json":
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+                return 0
+            _print_review_macro(args.account, summary, stored=True)
+            return 0
+
+        results, pending = build_trade_reviews(
+            db, account_id, horizon=args.horizon, lookback=args.lookback, save=args.save)
+
+        if args.format == "json":
+            print(json.dumps(
+                {"reviews": results, "pending": pending,
+                 "summary": summarize_reviews(results)},
+                ensure_ascii=False, indent=2, default=str))
+            return 0
+
+        if not results:
+            print(f"# 操作复盘 — 账户 {args.account}\n\n"
+                  f"近 {args.lookback} 天内没有满 {args.horizon} 天可评定的操作"
+                  f"（{pending} 笔太新、待观察）。")
+            return 0
+
+        print(f"# 操作复盘评定 — 账户 {args.account}（事后 {args.horizon} 天回看）\n")
+        print("| 交易日 | 方向 | 基金 | 事后涨跌 | 评定 | 教训 |")
+        print("|--------|------|------|---------:|------|------|")
+        for r in results:
+            act = "买入" if r["action"] == "buy" else "卖出"
+            pr = r.get("post_return_pct")
+            pr_s = f"{pr*100:+.2f}%" if pr is not None else "—"
+            print(f"| {r['date']} | {act} | {r['name']} | {pr_s} | "
+                  f"{r['badge']} | {r['lesson']} |")
+        if pending:
+            print(f"\n> 另有 {pending} 笔操作太新（不足 {args.horizon} 天），暂列待观察。")
+        print()
+        _print_review_macro(args.account, summarize_reviews(results), stored=False)
+        if args.save:
+            print(f"\n✅ 已写入记忆（trade_reviews），可用 `db.py reviews --account {args.account}` 回看。")
+        return 0
+    finally:
+        db.close()
+
+
+def _print_review_macro(account, summary, stored=False):
+    """打印复盘宏观总结。"""
+    if not summary.get("count"):
+        print("（暂无足够样本产生宏观结论）")
+        return
+    bw, sw = summary.get("buy_timing_winrate"), summary.get("sell_timing_winrate")
+    bw_s = f"{bw*100:.0f}%" if bw is not None else "—"
+    sw_s = f"{sw*100:.0f}%" if sw is not None else "—"
+    src = "（已存记忆）" if stored else ""
+    print(f"## 宏观复盘{src}\n")
+    print(f"- 买入择时胜率 **{bw_s}**（{summary.get('buy_count',0)} 笔）"
+          f" · 卖出择时胜率 **{sw_s}**（{summary.get('sell_count',0)} 笔）"
+          f" · 综合均分 **{summary.get('avg_score')}**")
+    if summary.get("recent_lessons"):
+        print("- 近期教训：")
+        for ls in summary["recent_lessons"]:
+            print(f"  - {ls}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="decide.py",
@@ -570,6 +746,23 @@ def main():
     p_why.add_argument("--account", default="主线", help="账户名称")
     p_why.add_argument("--code", required=True, help="基金代码")
     p_why.set_defaults(func=cmd_why_not)
+
+    p_review = sub.add_parser(
+        "review",
+        help="复盘历史操作：事后N天净值判断当初买卖是否踩中，--save 写入记忆",
+    )
+    p_review.add_argument("--account", default="主线", help="账户名称")
+    p_review.add_argument("--horizon", type=int, default=7,
+                          help="事后回看天数（自然日，默认7≈一周）")
+    p_review.add_argument("--lookback", type=int, default=60,
+                          help="复盘最近多少天内的操作（默认60）")
+    p_review.add_argument("--save", action="store_true",
+                          help="把评定写入 trade_reviews（记忆），供宏观判断复用")
+    p_review.add_argument("--summary", action="store_true",
+                          help="只读已存记忆的宏观总结，不重新计算")
+    p_review.add_argument("--format", choices=["md", "json"], default="md",
+                          help="输出格式（默认: md）")
+    p_review.set_defaults(func=cmd_review)
 
     args = ap.parse_args()
     sys.exit(args.func(args))

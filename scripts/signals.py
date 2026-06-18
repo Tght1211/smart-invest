@@ -10,6 +10,7 @@ that's P5 work, gated on backtest evidence per the design spec.
 """
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 
@@ -159,4 +160,62 @@ def attach_signals(navs: List[float]) -> dict:
         "macd_hist": compute_macd(navs)[2],
         "ma20_slope": compute_ma_slope(navs, window=20, lookback=5),
         "breakout_20d": compute_breakout(navs, lookback=20),
+    }
+
+
+# ---------- 波动 / 回撤 / 动量（P5 报告层，纯展示，不进引擎决策） ----------
+
+def compute_volatility(navs: List[float], window: int = 20, annualize: bool = True) -> Optional[float]:
+    """近 window 日年化波动率 = 日收益标准差 × √252。数据不足用现有全部，<3 根返回 None。"""
+    if not navs:
+        return None
+    seq = navs[-(window + 1):] if len(navs) > window + 1 else navs
+    if len(seq) < 3:
+        return None
+    rets = [seq[i] / seq[i - 1] - 1 for i in range(1, len(seq)) if seq[i - 1]]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    sd = math.sqrt(var)
+    return round(sd * math.sqrt(252) if annualize else sd, 4)
+
+
+def compute_max_drawdown(navs: List[float]) -> Optional[float]:
+    """区间最大回撤（峰值→谷底最大跌幅，负数）。数据不足返回 None。"""
+    if not navs or len(navs) < 2:
+        return None
+    peak = navs[0]
+    mdd = 0.0
+    for v in navs:
+        if v > peak:
+            peak = v
+        if peak:
+            mdd = min(mdd, v / peak - 1)
+    return round(mdd, 4)
+
+
+def compute_period_return(navs: List[float], lookback: int) -> Optional[float]:
+    """近 lookback 个交易日收益率（动量）。数据不足用最早一根作基准。"""
+    if not navs or len(navs) < 2:
+        return None
+    base = navs[-(lookback + 1)] if len(navs) > lookback else navs[0]
+    if not base:
+        return None
+    return round(navs[-1] / base - 1, 4)
+
+
+def tech_panel(navs: List[float]) -> dict:
+    """报告层技术/波动面板汇总（navs 升序）。仅供展示与我的推理，不驱动引擎买卖。"""
+    return {
+        "rsi_14": compute_rsi(navs, period=14),
+        "macd_hist": compute_macd(navs)[2],
+        "ma20_slope": compute_ma_slope(navs, window=20, lookback=5),
+        "ma60_slope": compute_ma_slope(navs, window=60, lookback=5),
+        "breakout_20d": compute_breakout(navs, lookback=20),
+        "vol_20d": compute_volatility(navs, window=20),
+        "vol_60d": compute_volatility(navs, window=60),
+        "max_drawdown_60d": compute_max_drawdown(navs[-60:] if len(navs) > 60 else navs),
+        "ret_1m": compute_period_return(navs, 20),
+        "ret_3m": compute_period_return(navs, 60),
     }

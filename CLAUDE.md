@@ -22,16 +22,16 @@ All position/trade CLIs take `--account <name>` to switch between them.
 
 | Script | Role |
 |---|---|
-| `scripts/db.py` | SQLite schema + CRUD CLI. Defines the `Database` class imported by other scripts. Honours `SMART_INVEST_DB` env var to relocate the DB (used by tests). Tables: `accounts`, `positions`, `trades` (with audit fields), `daily_snapshots`, `decision_tree_versions`, `strategy_evolutions`, `simulation_runs`. |
-| `scripts/fetch_fund.py` | Market data via 天天基金/东方财富 public HTTP endpoints (no auth). Subcommands: `market-summary`, `indices`, `sectors`, `estimate`, `nav`, `rank`, `index-kline`, `portfolio-check`, `portfolio-show`, `orders-show`, **`market-snapshot`**. The `gather_market_snapshot()` function is the data feed for `decide.py`. |
-| `scripts/decision_engine.py` | The rule engine. `DecisionEngine.decide()` returns a structured **decision packet** (schema in `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` §6). 25 unit tests in `tests/test_decision_engine.py` pin its behaviour. Old `check_*` helpers retained for backtest compatibility. |
-| `scripts/decide.py` | **The single decision entry point.** Thin CLI wrapping `fetch_fund.gather_market_snapshot` + `DecisionEngine.decide`. Subcommands: `run` (JSON/md/brief), `stats` (per-rule win/loss), `evolve` (writes strategy_evolutions), `why-not` (explains why a code isn't in actions). All `SKILL.md` analysis modes route through this. |
+| `scripts/db.py` | SQLite schema + CRUD CLI. Defines the `Database` class imported by other scripts. Honours `SMART_INVEST_DB` env var to relocate the DB (used by tests). Tables: `accounts`, `positions`, `trades` (with audit fields), `daily_snapshots`, `decision_tree_versions`, `strategy_evolutions`, `simulation_runs`, **`trade_reviews`** (per-trade timing verdict "memory"; self-heals on existing DBs via `_ensure_review_table`). Review CRUD: `add_trade_review`/`get_trade_reviews`/`get_review_summary`; CLI `db.py reviews`. |
+| `scripts/fetch_fund.py` | Market data via 天天基金/东方财富 public HTTP endpoints (no auth). Subcommands: `market-summary`, `indices`, `sectors`, `estimate`, `nav`, `rank`, `index-kline`, `portfolio-check`, `portfolio-show`, `orders-show`, **`market-snapshot`**, **`returns`** (per-fund + total return trajectory w/ sparkline), **`news`** (free 东方财富 7x24 快讯, `gather_market_news()`, no key). `portfolio-check/show` now show **持有天数** (`_held_days`). `gather_market_snapshot()` feeds `decide.py` and now also carries `news` + `recent_review_summary` (report-layer, not rule-driving). |
+| `scripts/decision_engine.py` | The rule engine. `DecisionEngine.decide()` returns a structured **decision packet** (schema in `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` §6). 25 unit tests in `tests/test_decision_engine.py` pin its behaviour. Old `check_*` helpers retained for backtest compatibility. Also exports module-level pure fn `evaluate_trade_timing(action, nav_at_trade, nav_after)` → 踩中/追高套牢/规避下跌/卖飞/中性 verdict + score (used by `decide.py review`). |
+| `scripts/decide.py` | **The single decision entry point.** Thin CLI wrapping `fetch_fund.gather_market_snapshot` + `DecisionEngine.decide`. Subcommands: `run` (JSON/md/brief), `stats` (per-rule win/loss), `evolve` (writes strategy_evolutions), `why-not` (explains why a code isn't in actions), **`review`** (retrospective timing verdict on past trades, `--save` writes `trade_reviews`). `build_trade_reviews()`/`summarize_reviews()` are reusable (shared with `daily_report.py`). All `SKILL.md` analysis modes route through this. |
 | `scripts/signals.py` | Phase 3 technical indicators (pure stdlib): `compute_rsi`, `compute_macd`, `compute_ma_slope`, `compute_breakout`, `attach_signals`. Used by `fetch_fund._fund_snapshot` to enrich each fund with a `signals` block. **Not used by any rule yet** — attached to `actions[].context.signals` for visibility; new rules gated on backtest evidence (P5). |
 | `scripts/simulate.py` | Backtest engine ("梦境训练"). Replays historical NAVs day-by-day, **must avoid future leak** — only use data with date ≤ current sim date. Auto-creates a `梦境-<sim_id>` account. Phase 2: `--engine` flag drives backtest via `DecisionEngine.decide()` (old inline rule path retained for compatibility). |
 | `scripts/send_email.py` | QQ-SMTP HTML email. Has `check` / `setup` / `setup --no-email` / `test` / `send` / `trade-notify` subcommands. `trade-notify` MUST fire after every buy/sell. Card DSL renderer (`:::card`/`:::spark`/`:::action`/`:::blocks`/`:::timeline`) lives in `markdown_to_html()`. |
 | `scripts/strategy_lab.py` | 梦境实验室: runs N strategy variants (rules_override injected into engine) over the same history window → metrics & ranking → `--evolve` writes strategy_evolutions → `--promote vX.Y` registers a new tree version AND rewrites `data/decision_tree.json`. Engine default version follows that file. Rule changes must pass the lab on ≥2 different market-regime windows before promotion. |
 | `scripts/chart.py` | Pure rendering, no network: terminal line charts (`fetch_fund.py chart …`) + email sparkline HTML (`:::spark`). |
-| `scripts/daily_report.py` | Deterministic three-session (open/mid/close) card report: data → engine → card → email → (close) auto-record. The entry point OpenClaw cron calls. Safety guards: take-profit skip (LET_WINNERS_RUN), stop-loss execute, QDII-buy skip, 7-day same-rule dedup. |
+| `scripts/daily_report.py` | Deterministic three-session (open/mid/close) card report: data → engine → card → email → (close) auto-record. The entry point OpenClaw cron calls. Cards now also render: per-holding 30d NAV sparks (`card_holding_sparks`), holdings 持有天数 column, free 财经要闻 (`card_news`), and a review-annotated operation timeline (`card_timeline` calls `build_trade_reviews(..., save=True)`). `--html [path]` renders the email HTML to a file for browser preview (no send). Safety guards: take-profit skip (LET_WINNERS_RUN), stop-loss execute, QDII-buy skip, 7-day same-rule dedup. |
 
 Decision rules are versioned: `data/decision_tree.json` is the live ruleset and `decision_tree_versions` table stores history with parent/changelog/reason for each version. The `strategy_evolutions` table records before/after metrics when a version is promoted from a backtest.
 
@@ -70,6 +70,16 @@ python3 scripts/decide.py run --account 主线 --format brief        # 3-5 line 
 python3 scripts/decide.py why-not --account 主线 --code 512480     # explain non-recommendation
 python3 scripts/decide.py stats --account 主线                     # per-rule win rate / expectancy
 python3 scripts/decide.py evolve --account 主线 --to-version v2.1  # write strategy_evolutions row
+python3 scripts/decide.py review --account 主线 --save             # retrospective timing verdict → trade_reviews
+python3 scripts/decide.py review --account 主线 --summary          # read stored review memory
+
+# Holding days / return trajectory / news / review memory
+python3 scripts/fetch_fund.py returns --account 主线 --days 30     # per-fund + total return change (sparkline)
+python3 scripts/fetch_fund.py news --keyword 半导体                # free 7x24 finance news (no key)
+python3 scripts/db.py reviews --account 主线                       # inspect stored operation reviews
+
+# Email card HTML preview (no send)
+python3 scripts/daily_report.py --session close --account 主线 --no-email --no-record --html
 
 # Backtest with engine
 python3 scripts/simulate.py run --start 2026-02-26 --end 2026-05-26 --budget 50000 --engine
@@ -92,7 +102,7 @@ python3 scripts/send_email.py check       # CONFIGURED / DISABLED / NOT_CONFIGUR
 python3 scripts/send_email.py test
 ```
 
-**Test suite**: `tests/test_decision_engine.py` (25 tests pinning engine rules) + `tests/test_decide_cli.py` (CLI smoke test). All stdlib `unittest`. No linter or build step.
+**Test suite**: `tests/test_decision_engine.py` (25 tests pinning engine rules) + `tests/test_decide_cli.py` (CLI smoke test) + `tests/test_review.py` (24 tests: `evaluate_trade_timing`, `trade_reviews` CRUD/upsert, `_held_days`/`_sparkline`/`_align_total_return_series`, `build_trade_reviews`/`summarize_reviews` with `fetch_nav_series` mocked) + others. 123 tests total, all stdlib `unittest`. No linter or build step.
 
 **Design docs** (Phase 1+):
 - Spec: `docs/superpowers/specs/2026-05-28-smart-invest-overhaul-design.md` — describes the decision-packet contract, rule priority, confidence formula, error handling.

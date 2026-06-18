@@ -85,6 +85,7 @@ def build_context(db, account, date):
     return {
         "packet": packet, "funds": funds, "positions": positions,
         "account_id": account_id, "total_value": total_value, "cash": cash,
+        "news": snap.get("news", []) or [],
     }, None
 
 
@@ -199,8 +200,8 @@ def card_holdings(ctx):
     funds, positions = ctx["funds"], ctx["positions"]
     by_pos = {p["code"]: p for p in ctx["packet"]["portfolio_snapshot"]["by_position"]}
     out = ["### 我的持仓（实时估值）", "",
-           "| 基金 | 今日 | 今日盈亏 | 昨日盈亏 | 累计 | 持有 |",
-           "|------|------|---------|---------|------|------|"]
+           "| 基金 | 今日 | 今日盈亏 | 昨日盈亏 | 累计 | 持有 | 天数 |",
+           "|------|------|---------|---------|------|------|------|"]
     for p in positions:
         f = funds.get(p["code"]) or {}
         cur = f.get("current_nav", p["cost_nav"])
@@ -209,10 +210,56 @@ def card_holdings(ctx):
         value = p["shares"] * cur
         cum_pct = by_pos.get(p["code"], {}).get("profit_pct", 0.0) * 100
         tp = _fmt_amt(today_pnl) if dr else "--"
+        hd = p.get("hold_days") or 0
+        hd_s = f"{hd}天" if hd else "--"
         out.append(
             f"| {_short_name(p['name'])} | {dr*100:+.2f}% | {tp} | -- | "
-            f"{cum_pct:+.2f}% | {value:,.0f} |"
+            f"{cum_pct:+.2f}% | {value:,.0f} | {hd_s} |"
         )
+    out.append("")
+    return out
+
+
+def card_holding_sparks(ctx, days=30):
+    """每只持仓近 N 天净值迷你走势（用户要的「持仓走势图都列出来」）。
+
+    逐只拉净值序列 → downsample → :::spark。某只网络失败则静默跳过它。
+    """
+    positions = ctx["positions"]
+    if not positions:
+        return []
+    try:
+        import chart as chart_mod
+    except Exception:
+        return []
+    out = [f"### 持仓走势（近{days}天净值）", ""]
+    any_spark = False
+    for p in positions:
+        series = fetch_fund.fetch_nav_series(p["code"], days=days)
+        navs = [nav for _, nav in series]
+        if len(navs) < 5:
+            continue
+        vals = chart_mod.downsample(navs, 60)
+        out += spark_lines(f"{_short_name(p['name'])} 近{days}天净值", navs[0], vals)
+        any_spark = True
+    return out if any_spark else []
+
+
+def card_news(ctx, limit=3):
+    """财经要闻（免费 7x24 快讯）。优先用 snapshot 已抓的 news，否则现拉。失败跳过。"""
+    news = (ctx.get("news") if isinstance(ctx, dict) else None) or []
+    if not news:
+        try:
+            news = fetch_fund.gather_market_news(limit=limit)
+        except Exception:
+            news = []
+    if not news:
+        return []
+    out = ["### 财经要闻", ""]
+    for it in news[:limit]:
+        ts = (it.get("time") or "")[-5:]
+        title = it.get("title", "").strip()
+        out.append(f"- {('['+ts+'] ') if ts else ''}{title}")
     out.append("")
     return out
 
@@ -233,15 +280,42 @@ def card_blocks():
     return out
 
 
-def card_timeline(db, account_id):
-    rows = db.get_trades(account_id, limit=6)
+def card_timeline(db, ctx):
+    """近期操作时间线 + 事后复盘点评（每笔标注「精准踩中 / 卖飞了」+ 事后涨跌）。"""
+    account_id = ctx["account_id"]
+    rows = db.get_trades(account_id, limit=8)
     if not rows:
         return []
-    out = ["### 近期操作", "", ":::timeline"]
+
+    # 复盘评定：trade_id → 评定结果；并产出宏观胜率（save=True 顺手写入记忆，幂等 upsert）
+    reviews, macro = {}, {}
+    try:
+        from decide import build_trade_reviews, summarize_reviews
+        results, _ = build_trade_reviews(db, account_id, horizon=7, lookback=45, save=True)
+        for r in results:
+            if r.get("trade_id") is not None and r.get("score") is not None:
+                reviews[r["trade_id"]] = r
+        macro = summarize_reviews(results)
+    except Exception:
+        pass
+
+    out = ["### 近期操作 & 复盘", ""]
+    if macro.get("count"):
+        bw, sw = macro.get("buy_timing_winrate"), macro.get("sell_timing_winrate")
+        bw_s = f"{bw*100:.0f}%" if bw is not None else "—"
+        sw_s = f"{sw*100:.0f}%" if sw is not None else "—"
+        out += [f"近 {macro['count']} 笔已评定：买入择时胜率 {bw_s}、卖出择时胜率 {sw_s}。逐笔回看 👇", ""]
+    out += [":::timeline"]
     for t in rows:
         dt = str(t["date"])[5:].replace("-", "/")
         act = "买入" if t["action"] == "buy" else "卖出"
-        out.append(f"{dt} | {act} {_short_name(t['name'])} ¥{t['amount']:,.0f}")
+        line = f"{dt} | {act} {_short_name(t['name'])} ¥{t['amount']:,.0f}"
+        rv = reviews.get(t["id"])
+        if rv:
+            pr = rv.get("post_return_pct")
+            pr_s = f"（事后{pr*100:+.1f}%）" if pr is not None else ""
+            line += f" → {rv['badge']}{pr_s}"
+        out.append(line)
     out += [":::", ""]
     return out
 
@@ -342,11 +416,13 @@ def _notify(account, action, code, name, amt, nav, shares, note):
 def assemble(db, ctx, session, recorded, skipped=None):
     md = []
     md += card_top(ctx, session)
-    md += card_spark(ctx)
+    md += card_spark(ctx)               # 纳指隔夜（QDII 当日方向）
     md += card_action(ctx, session, recorded, skipped)
     md += card_holdings(ctx)
+    md += card_holding_sparks(ctx)      # 每只持仓近30天净值走势
     md += card_blocks()
-    md += card_timeline(db, ctx["account_id"])
+    md += card_news(ctx)                # 财经要闻（免费 7x24 快讯）
+    md += card_timeline(db, ctx)        # 近期操作 + 事后复盘点评
     return "\n".join(md)
 
 
@@ -358,6 +434,8 @@ def main():
     ap.add_argument("--no-email", action="store_true", help="只生成不发邮件")
     ap.add_argument("--no-record", action="store_true", help="盘尾不自动记账")
     ap.add_argument("--print", action="store_true", help="把卡片 markdown 打到 stdout")
+    ap.add_argument("--html", metavar="PATH", nargs="?", const="__auto__",
+                    help="渲染邮件 HTML 到文件供浏览器预览（不发信）；省略路径则写 reports/preview-<session>-<date>.html")
     args = ap.parse_args()
 
     date = args.date or datetime.now().strftime("%Y-%m-%d")
@@ -375,6 +453,20 @@ def main():
         md = assemble(db, ctx, args.session, recorded, skipped)
         if args.print:
             print(md)
+
+        # HTML 预览：渲染到文件供浏览器打开（不发信）
+        if args.html:
+            html = send_email.markdown_to_html(md)
+            if args.html == "__auto__":
+                out_dir = SCRIPT_DIR.parent / "reports"
+                out_dir.mkdir(exist_ok=True)
+                out_path = out_dir / f"preview-{args.session}-{date}.html"
+            else:
+                out_path = Path(args.html)
+            out_path.write_text(html, encoding="utf-8")
+            print(f"[OK] 邮件 HTML 预览已写入: {out_path}")
+            print(f"     用浏览器打开:  open {out_path}")
+            return 0
 
         if not args.no_email:
             sess = SESSIONS[args.session]

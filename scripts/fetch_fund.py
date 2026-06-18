@@ -113,6 +113,164 @@ def _parse_jsonp(text):
     return None
 
 
+# ========== 免费财经新闻（东方财富 7x24 快讯，无需 key） ==========
+
+NEWS_ENDPOINTS = [
+    # 7x24 全球财经快讯（var ajaxResult={...}）
+    "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html",
+    # 备用：web fast news 接口
+    "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+    "?client=web&biz=web_724&fastColumn=102&sortEnd=&pageSize=30&req_trace=si",
+]
+
+
+def _extract_json_blob(text):
+    """从 JS/JSONP（var x={...}）响应里抠出第一个 JSON 对象。失败返回 None。"""
+    if not text:
+        return None
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _news_items_from(blob):
+    """从不同结构的东财响应里取新闻列表 → [{time,title,summary,url}]。"""
+    if not isinstance(blob, dict):
+        return []
+    items = None
+    for key in ("LivesList", "fastNewsList", "list", "newslist", "News"):
+        if isinstance(blob.get(key), list):
+            items = blob[key]
+            break
+    if items is None and isinstance(blob.get("data"), dict):
+        for key in ("fastNewsList", "list", "News", "newslist", "LivesList"):
+            if isinstance(blob["data"].get(key), list):
+                items = blob["data"][key]
+                break
+    out = []
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or it.get("Title") or it.get("digest") or "").strip()
+        if not title:
+            continue
+        summary = (it.get("digest") or it.get("summary") or it.get("Digest") or "").strip()
+        t = (it.get("showtime") or it.get("showTime") or it.get("ShowTime")
+             or it.get("time") or "")
+        url = (it.get("url_w") or it.get("url") or it.get("Url_W") or it.get("Url") or "")
+        out.append({"time": str(t)[:16], "title": title,
+                    "summary": summary[:120], "url": url})
+    return out
+
+
+def gather_market_news(keyword=None, limit=10):
+    """免费财经快讯（东方财富 7x24）。失败返回 []，绝不抛异常。
+
+    keyword 给定时按 标题+摘要 关键词过滤（如 半导体/纳指/降准）。
+    这是**报告层**数据，不驱动引擎决策。供 daily_report / market-snapshot 的无 LLM 路使用；
+    Claude 在交互会话里分析时优先用 WebSearch 拿更丰富的当日新闻，本函数是定时路兜底。
+    """
+    items = []
+    for ep in NEWS_ENDPOINTS:
+        text = _get(ep, headers={"Referer": "https://kuaixun.eastmoney.com/"})
+        items = _news_items_from(_extract_json_blob(text))
+        if items:
+            break
+    if keyword:
+        kw = str(keyword).strip()
+        items = [it for it in items
+                 if kw in it["title"] or kw in it.get("summary", "")]
+    return items[:limit]
+
+
+def cmd_news(args):
+    """免费财经快讯（可 --keyword 过滤）"""
+    items = gather_market_news(keyword=args.keyword, limit=args.limit)
+    if not items:
+        print("（未取到快讯——交互分析时请改用 WebSearch 拿当日新闻）")
+        return
+    kw = f"（关键词: {args.keyword}）" if args.keyword else ""
+    print(f"\n📰 财经要闻 {kw}— 东方财富 7x24")
+    print("-" * 80)
+    for it in items:
+        ts = f"[{it['time']}] " if it.get("time") else ""
+        print(f"{ts}{it['title']}")
+        if it.get("summary"):
+            print(f"    {it['summary']}")
+    print()
+
+
+# ========== 持有天数 / 收益趋势 辅助 ==========
+
+def _held_days(buy_date, ref=None):
+    """持有天数：买入日期 → 今天（自然日）。无法解析返回 None。"""
+    if not buy_date:
+        return None
+    ref = ref or datetime.now()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            d = datetime.strptime(str(buy_date)[:10], fmt)
+            return max(0, (ref.date() - d.date()).days)
+        except ValueError:
+            continue
+    return None
+
+
+def _sparkline(values):
+    """数值序列 → unicode 迷你走势（▁▂▃▄▅▆▇█）。None 渲染为空格。"""
+    bars = "▁▂▃▄▅▆▇█"
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return ""
+    lo, hi = min(nums), max(nums)
+    if hi == lo:
+        return bars[3] * len(values)
+    out = ""
+    for v in values:
+        if v is None:
+            out += " "
+            continue
+        idx = int((v - lo) / (hi - lo) * (len(bars) - 1))
+        out += bars[idx]
+    return out
+
+
+def _align_total_return_series(holdings):
+    """把多只基金的净值序列对齐成组合「总收益率」时间序列（网络派生，不依赖快照）。
+
+    holdings: [(shares, cost_nav, [(date, nav)])]
+    返回 [(date, total_return_pct)]，仅取所有基金都有净值的日期区间（前向填充）。
+    """
+    series_maps = []
+    total_cost = 0.0
+    for shares, cost, series in holdings:
+        if not series or not cost or shares <= 0:
+            continue
+        series_maps.append((shares, dict(series), [d for d, _ in series]))
+        total_cost += shares * cost
+    if not series_maps or total_cost <= 0:
+        return []
+
+    all_dates = sorted({d for _, m, _ in series_maps for d in m})
+    # 起点 = 各基金最早净值日的最大值（保证每只都有数据）
+    start = max(dates[0] for _, _, dates in series_maps)
+    out = []
+    last_nav = {}
+    for d in all_dates:
+        for i, (_, m, _) in enumerate(series_maps):
+            if d in m:
+                last_nav[i] = m[d]
+        if d < start or len(last_nav) < len(series_maps):
+            continue
+        total_val = sum(series_maps[i][0] * last_nav[i] for i in range(len(series_maps)))
+        out.append((d, (total_val - total_cost) / total_cost))
+    return out
+
+
 def cmd_indices(args):
     """获取大盘指数实时行情"""
     secids = ",".join(INDICES.values())
@@ -244,28 +402,38 @@ def _resolve_chart_target(target):
 
 
 def fetch_nav_series(code, days=60):
-    """基金历史净值（升序时间）→ [(date, nav)]，失败返回 []。"""
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
-    url = (
-        f"https://api.fund.eastmoney.com/f10/lsjz?"
-        f"fundCode={code}&pageIndex=1&pageSize={days}"
-        f"&startDate={start_date}&endDate={end_date}"
-    )
-    text = _get(url)
-    if not text:
-        return []
-    try:
-        nav_list = json.loads(text).get("Data", {}).get("LSJZList", [])
-    except Exception:
-        return []
+    """基金历史净值（升序时间）→ [(date, nav)]，失败返回 []。
+
+    东财 lsjz 接口每页固定 20 根（pageSize 参数不生效），需用 pageIndex 翻页，
+    故此处翻页累积到取够 `days` 根（newest-first → 反转为升序）。
+    """
     out = []
-    for item in nav_list:
+    page = 1
+    max_pages = days // 20 + 3  # 多翻几页兜底，避免节假日导致的稀疏
+    while len(out) < days and page <= max_pages:
+        url = (
+            f"https://api.fund.eastmoney.com/f10/lsjz?"
+            f"fundCode={code}&pageIndex={page}&pageSize=20"
+        )
+        text = _get(url, headers={"Referer": "http://fundf10.eastmoney.com/"})
+        if not text:
+            break
         try:
-            out.append((item.get("FSRQ", ""), float(item.get("DWJZ"))))
-        except (TypeError, ValueError):
-            continue
-    out.reverse()  # 接口倒序 → 升序
+            nav_list = json.loads(text).get("Data", {}).get("LSJZList", [])
+        except Exception:
+            break
+        if not nav_list:
+            break  # 翻到底
+        for item in nav_list:
+            try:
+                out.append((item.get("FSRQ", ""), float(item.get("DWJZ"))))
+            except (TypeError, ValueError):
+                continue
+        if len(nav_list) < 20:
+            break  # 最后一页
+        page += 1
+    out = out[:days]      # newest-first，截到所需天数
+    out.reverse()         # → 升序
     return out
 
 
@@ -553,6 +721,68 @@ def cmd_rank(args):
         print(f"{rank_no:>4} {code:<8} {name:<24} {venue:<5} {nav:>8} {date:<12} {zzf:>9}%")
 
 
+def _pct(x, signed=False):
+    """把小数转百分比字符串，None → —"""
+    if x is None:
+        return "—"
+    return f"{x*100:+.1f}%" if signed else f"{x*100:.1f}%"
+
+
+def cmd_tech(args):
+    """技术/波动面分析（报告层，只读，不改引擎决策）。
+
+    汇总近期/历史 波动率·回撤·趋势·突破·RSI·动量，供每次分析时加权推理。
+    用法：tech <基金代码>  或  tech --account 主线（分析全持仓）。
+    """
+    import signals as sig
+
+    targets = []
+    code = getattr(args, "code", None)
+    if code:
+        targets.append((code, code))
+    elif getattr(args, "account", None) and DB_AVAILABLE:
+        db = Database()
+        acc = db.get_account(name=args.account)
+        if not acc:
+            print(f"[ERROR] 账户不存在: {args.account}")
+            db.close()
+            return
+        for p in db.get_positions(acc["id"]):
+            targets.append((p["code"], p["name"]))
+        db.close()
+    if not targets:
+        print("用法: python3 fetch_fund.py tech <基金代码>  或  tech --account 主线")
+        return
+
+    print("\n技术/波动面分析（报告层 · 仅供参考与加权推理，不驱动引擎买卖）")
+    print("=" * 74)
+    for code, name in targets:
+        series = fetch_nav_series(code, days=90)
+        navs = [v for _, v in series]
+        venue = fund_venue(code, name)
+        if len(navs) < 10:
+            print(f"\n■ {name} ({code}) [{venue}]：净值数据不足（{len(navs)} 根），跳过")
+            continue
+        p = sig.tech_panel(navs)
+        rsi = p["rsi_14"]
+        rsi_tag = "超卖" if rsi is not None and rsi < 30 else ("超买" if rsi is not None and rsi > 70 else "中性")
+        ma20, ma60 = p["ma20_slope"] or 0, p["ma60_slope"] or 0
+        trend20 = "上行" if ma20 > 0 else ("下行" if ma20 < 0 else "走平")
+        trend60 = "上行" if ma60 > 0 else ("下行" if ma60 < 0 else "走平")
+        vol = p["vol_60d"]
+        vol_tag = "高" if vol is not None and vol > 0.35 else ("低" if vol is not None and vol < 0.18 else "中")
+        macd_tag = "多头" if (p["macd_hist"] or 0) > 0 else "空头"
+        bo = "是" if p["breakout_20d"] else "否"
+        rsi_str = f"{rsi:.0f}（{rsi_tag}）" if rsi is not None else "—"
+
+        print(f"\n■ {name} ({code}) [{venue}]")
+        print(f"  动量   近1月 {_pct(p['ret_1m'], True)} | 近3月 {_pct(p['ret_3m'], True)}")
+        print(f"  波动   60日年化波动率 {_pct(vol)}（{vol_tag}）| 近60日最大回撤 {_pct(p['max_drawdown_60d'], True)}")
+        print(f"  趋势   MA20 {trend20} | MA60 {trend60} | 突破20日新高 {bo}")
+        print(f"  强弱   RSI14 {rsi_str} | MACD {macd_tag}")
+    print("=" * 74)
+
+
 def cmd_index_kline(args):
     """获取指数历史K线"""
     secid = args.secid
@@ -623,8 +853,8 @@ def cmd_portfolio_check(args):
     account_label = account_name or "本地"
     print(f"\n持仓基金实时诊断 ({datetime.now().strftime('%Y-%m-%d %H:%M')}) - 账户: {account_label}")
     print("=" * 80)
-    print(f"{'基金名称':<20} {'估值涨幅':>8} {'估算净值':>8} {'成本净值':>8} {'持有份额':>10} {'估算盈亏':>12} {'累计收益':>10}")
-    print("-" * 80)
+    print(f"{'基金名称':<20} {'估值涨幅':>8} {'估算净值':>8} {'成本净值':>8} {'持有份额':>10} {'估算盈亏':>12} {'累计收益':>10} {'持有':>7}")
+    print("-" * 88)
 
     total_estimated_value = 0
     total_cost = 0
@@ -635,6 +865,8 @@ def cmd_portfolio_check(args):
         name = holding.get("name", code)
         shares = holding.get("shares", 0)
         cost_nav = holding.get("cost_nav", 0)
+        held = _held_days(holding.get("buy_date"))
+        held_str = f"{held}天" if held is not None else "--"
 
         # 获取实时估值
         url = f"http://fundgz.1234567.com.cn/js/{code}.js"
@@ -660,10 +892,10 @@ def cmd_portfolio_check(args):
             pnl_sign = "+" if total_pnl >= 0 else ""
             print(
                 f"{name:<20} {sign}{est_pct:>6.2f}% {est_nav:>8.4f} {cost_nav:>8.4f} "
-                f"{shares:>10.2f} {pnl_sign}{today_pnl:>10.2f} {pnl_sign}{total_pnl_pct:>8.2f}%"
+                f"{shares:>10.2f} {pnl_sign}{today_pnl:>10.2f} {pnl_sign}{total_pnl_pct:>8.2f}% {held_str:>7}"
             )
         else:
-            print(f"{name:<20} {'--':>8} {'--':>8} {cost_nav:>8.4f} {shares:>10.2f} {'--':>12} {'--':>10}")
+            print(f"{name:<20} {'--':>8} {'--':>8} {cost_nav:>8.4f} {shares:>10.2f} {'--':>12} {'--':>10} {held_str:>7}")
 
     print("=" * 80)
     if total_cost > 0:
@@ -702,15 +934,112 @@ def cmd_portfolio_show(args):
 
     account_label = account_name or "本地"
     print(f"\n当前持仓 ({len(portfolio)} 只基金) - 账户: {account_label}:")
-    print("-" * 70)
-    print(f"{'基金代码':<8} {'基金名称':<20} {'持有份额':>10} {'成本净值':>8} {'买入日期':<12} {'备注':<10}")
-    print("-" * 70)
+    print("-" * 82)
+    print(f"{'基金代码':<8} {'基金名称':<20} {'持有份额':>10} {'成本净值':>8} {'买入日期':<12} {'持有天数':>8} {'备注':<10}")
+    print("-" * 82)
     for h in portfolio:
+        held = _held_days(h.get('buy_date'))
+        held_str = f"{held}天" if held is not None else "--"
         print(
             f"{h.get('code', ''):<8} {h.get('name', ''):<20} "
             f"{h.get('shares', 0):>10.2f} {h.get('cost_nav', 0):>8.4f} "
-            f"{h.get('buy_date', ''):<12} {h.get('note', ''):<10}"
+            f"{h.get('buy_date', ''):<12} {held_str:>8} {h.get('note', ''):<10}"
         )
+
+
+def _load_portfolio(account_name):
+    """读持仓（优先 DB，回退 JSON）。返回 list 或 None。"""
+    if DB_AVAILABLE and account_name:
+        db = Database()
+        account = db.get_account(name=account_name)
+        if not account:
+            db.close()
+            return None
+        portfolio = db.get_positions(account["id"])
+        db.close()
+        return portfolio
+    if PORTFOLIO_FILE.exists():
+        with open(PORTFOLIO_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def cmd_returns(args):
+    """单只基金收益变化 + 组合总收益变化（净值序列派生，含迷你走势）。"""
+    account_name = getattr(args, "account", None)
+    days = getattr(args, "days", 30)
+    only_code = getattr(args, "code", None)
+
+    portfolio = _load_portfolio(account_name)
+    if portfolio is None:
+        print(f"[ERROR] 账户不存在: {account_name}")
+        return
+    if not portfolio:
+        print("当前无持仓")
+        return
+    if only_code:
+        portfolio = [h for h in portfolio if h.get("code") == only_code]
+        if not portfolio:
+            print(f"持仓中未找到 {only_code}")
+            return
+
+    account_label = account_name or "本地"
+    print(f"\n收益变化趋势（最近 {days} 天）- 账户: {account_label}")
+    print("=" * 92)
+    print(f"{'基金名称':<20} {'现值净值':>9} {'累计收益':>9} {f'较{days}天前':>10} {'持有':>6}  走势")
+    print("-" * 92)
+
+    holdings_for_total = []
+    for h in portfolio:
+        code = h.get("code", "")
+        name = h.get("name", code)
+        shares = h.get("shares", 0)
+        cost_nav = h.get("cost_nav", 0)
+        series = fetch_nav_series(code, days=days)
+
+        # 今日实时估值作为序列最新点
+        est = _parse_jsonp(_get(f"http://fundgz.1234567.com.cn/js/{code}.js"))
+        cur_nav = float(est["gsz"]) if est and est.get("gsz") else (
+            series[-1][1] if series else cost_nav)
+        held = _held_days(h.get("buy_date"))
+        held_str = f"{held}天" if held is not None else "--"
+
+        if not series or not cost_nav:
+            print(f"{name:<20} {cur_nav:>9.4f} {'--':>9} {'--':>10} {held_str:>6}  （无净值序列）")
+            holdings_for_total.append((shares, cost_nav, series))
+            continue
+
+        traj = [(d, (nav - cost_nav) / cost_nav) for d, nav in series]
+        traj.append(("now", (cur_nav - cost_nav) / cost_nav))
+        cur_ret = traj[-1][1]
+        delta = cur_ret - traj[0][1]
+        spark = _sparkline([r for _, r in traj])
+        print(f"{name:<20} {cur_nav:>9.4f} {cur_ret*100:>+8.2f}% "
+              f"{delta*100:>+9.2f}pt {held_str:>6}  {spark}")
+        holdings_for_total.append((shares, cost_nav, series))
+
+    # ===== 组合总收益变化 =====
+    print("=" * 92)
+    total_series = _align_total_return_series(holdings_for_total)
+    # 当前总收益（用实时估值）
+    cur_val = cur_cost = 0.0
+    for h in portfolio:
+        code = h.get("code", "")
+        shares = h.get("shares", 0)
+        cost_nav = h.get("cost_nav", 0)
+        est = _parse_jsonp(_get(f"http://fundgz.1234567.com.cn/js/{code}.js"))
+        nav = float(est["gsz"]) if est and est.get("gsz") else cost_nav
+        cur_val += shares * nav
+        cur_cost += shares * cost_nav
+    cur_total_ret = (cur_val - cur_cost) / cur_cost if cur_cost else 0
+    print(f"组合总收益: {cur_total_ret*100:+.2f}%  （现值 ¥{cur_val:,.0f} / 成本 ¥{cur_cost:,.0f}）")
+    if total_series and len(total_series) >= 2:
+        first = total_series[0][1]
+        spark = _sparkline([r for _, r in total_series])
+        print(f"总收益变化: 较{days}天前 {(cur_total_ret-first)*100:+.2f}pt "
+              f"（{total_series[0][0]} {first*100:+.1f}% → 今日 {cur_total_ret*100:+.1f}%）")
+        print(f"  走势: {spark}")
+    print()
 
 
 def cmd_orders_show(args):
@@ -1037,6 +1366,16 @@ def gather_market_snapshot(account_name="主线", date=None):
         except Exception:
             peak = None
 
+        # 报告层附加：财经快讯 + 操作复盘记忆（不驱动引擎，仅供叙事/宏观判断）
+        try:
+            news = gather_market_news(limit=8)
+        except Exception:
+            news = []
+        try:
+            review_summary = db.get_review_summary(account_id, lookback_days=60)
+        except Exception:
+            review_summary = {"count": 0}
+
         return {
             "hs300_5d_return": hs300_5d,
             "hs300_20d_return": hs300_20d,
@@ -1044,6 +1383,8 @@ def gather_market_snapshot(account_name="主线", date=None):
             "funds": funds,
             "portfolio_peak_value": peak,
             "index_trend": index_trend,
+            "news": news,
+            "recent_review_summary": review_summary,
         }
     finally:
         db.close()
@@ -1086,6 +1427,11 @@ def main():
     p_nav.add_argument("code", help="基金代码")
     p_nav.add_argument("--days", type=int, default=30, help="查询天数（默认30）")
 
+    # tech — 技术/波动面分析（报告层）
+    p_tech = sub.add_parser("tech", help="技术/波动面分析：波动率/回撤/趋势/突破/RSI/动量（报告层只读）")
+    p_tech.add_argument("code", nargs="?", help="基金代码（省略则配合 --account 分析全持仓）")
+    p_tech.add_argument("--account", "-a", help="账户名（分析该账户全部持仓）")
+
     # rank
     p_rank = sub.add_parser("rank", help="基金排行")
     p_rank.add_argument("--type", default="all", choices=["gp", "hh", "zj", "zs", "qdii", "all"], help="基金类型")
@@ -1111,6 +1457,17 @@ def main():
     p_oshow.add_argument("--account", "-a", help="账户名称（可选，默认读取本地订单）")
     p_oshow.add_argument("--limit", "-l", type=int, default=50, help="显示条数（默认50）")
 
+    # returns — 单只 + 总收益变化趋势
+    p_ret = sub.add_parser("returns", help="单只基金 + 组合总收益变化（含迷你走势）")
+    p_ret.add_argument("--account", "-a", help="账户名称（可选，默认读取本地持仓）")
+    p_ret.add_argument("--code", "-c", help="只看单只基金代码")
+    p_ret.add_argument("--days", "-d", type=int, default=30, help="回看天数（默认30）")
+
+    # news — 免费财经快讯
+    p_news = sub.add_parser("news", help="免费财经快讯（东方财富7x24，可--keyword过滤）")
+    p_news.add_argument("--keyword", "-k", help="按关键词过滤（如 半导体/纳指/降准）")
+    p_news.add_argument("--limit", "-l", type=int, default=10, help="条数（默认10）")
+
     # market-summary
     sub.add_parser("market-summary", help="市场全景（指数+板块）")
 
@@ -1134,11 +1491,14 @@ def main():
         "chart": cmd_chart,
         "estimate": cmd_estimate,
         "nav": cmd_nav,
+        "tech": cmd_tech,
         "rank": cmd_rank,
         "index-kline": cmd_index_kline,
         "portfolio-check": cmd_portfolio_check,
         "portfolio-show": cmd_portfolio_show,
         "orders-show": cmd_orders_show,
+        "returns": cmd_returns,
+        "news": cmd_news,
         "market-summary": cmd_market_summary,
         "market-snapshot": cmd_market_snapshot,
     }

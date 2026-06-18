@@ -15,6 +15,61 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import Database
 
 
+def evaluate_trade_timing(action, nav_at_trade, nav_after, horizon_days=None,
+                          threshold=0.02, scale=0.10):
+    """评定一笔历史交易的择时是否「正确踩中」（纯函数，无网络、无 DB）。
+
+    用交易当时净值与事后 N 天净值对比：
+      - 买入：事后涨=踩中(+)、跌=追高套牢(-)
+      - 卖出：事后跌=规避下跌(+)、涨=卖飞(-)
+      - |涨跌| < threshold（默认 2%）→ 中性，score≈0
+
+    返回 {post_return_pct, verdict, score, lesson}。
+    score ∈ [-1, 1]，= 截断(事后涨跌 / scale)，卖出取反；scale=0.10 即 ±10% 满分。
+    数据无效（净值缺失/<=0）→ verdict='数据缺失'，score=None。
+    """
+    htxt = f"{horizon_days}天" if horizon_days else "至今"
+    if not nav_at_trade or nav_at_trade <= 0 or nav_after is None or nav_after <= 0:
+        return {"post_return_pct": None, "verdict": "数据缺失", "score": None,
+                "lesson": f"缺净值数据，无法评定（视界 {htxt}）。"}
+
+    pr = (nav_after - nav_at_trade) / nav_at_trade
+    pct = abs(pr) * 100
+
+    def _clamp(x):
+        v = round(max(-1.0, min(1.0, x)), 4)
+        return v + 0.0 if v != 0 else 0.0
+
+    if action == "buy":
+        signed = pr
+        if pr >= threshold:
+            verdict = "踩中"
+            lesson = f"买入后{htxt}涨{pct:.1f}%，择时踩中，同类信号可复用。"
+        elif pr <= -threshold:
+            verdict = "追高套牢"
+            lesson = f"买入后{htxt}跌{pct:.1f}%，择时偏早/追高，下次等回调或趋势确认再进。"
+        else:
+            verdict = "中性"
+            lesson = f"买入后{htxt}仅波动{pct:.1f}%，影响有限，信号中性。"
+    elif action == "sell":
+        signed = -pr
+        if pr <= -threshold:
+            verdict = "规避下跌"
+            lesson = f"卖出后{htxt}跌{pct:.1f}%，成功规避回撤，止损/止盈纪律有效。"
+        elif pr >= threshold:
+            verdict = "卖飞"
+            lesson = f"卖出后{htxt}涨{pct:.1f}%，卖飞了，趋势未走完时别过早离场。"
+        else:
+            verdict = "中性"
+            lesson = f"卖出后{htxt}仅波动{pct:.1f}%，影响有限，信号中性。"
+    else:
+        return {"post_return_pct": round(pr, 4), "verdict": "未知方向",
+                "score": None, "lesson": f"未知操作方向 {action}，跳过评定。"}
+
+    return {"post_return_pct": round(pr, 4), "verdict": verdict,
+            "score": _clamp(signed / scale), "lesson": lesson}
+
+
 class DecisionEngine:
     """决策引擎：执行规则 + 记录审计日志"""
 
