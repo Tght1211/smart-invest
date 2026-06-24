@@ -491,6 +491,7 @@ def markdown_to_html(md_text):
 <table width="100%" cellpadding="0" cellspacing="0">
 <tr><td style="padding:20px;text-align:center;">
   <p style="margin:0;font-size:11px;color:#CCCCCC;">Smart Invest &middot; 投资有风险，入市需谨慎</p>
+  <p style="margin:4px 0 0;font-size:11px;color:#AAAAAA;">由小杀 🔪 (OpenClaw Agent · Claude Sonnet 4) 自动生成并发送</p>
 </td></tr>
 </table>
 
