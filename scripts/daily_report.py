@@ -56,19 +56,24 @@ def build_context(db, account, date):
     cash = row["cash"] or 0.0
 
     positions = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
     for r in db.conn.execute(
         "SELECT code, name, shares, cost_nav, sector, buy_date "
         "FROM positions WHERE account_id = ?", (account_id,)
     ):
         hold_days = 0
+        is_pending = False
         if r["buy_date"]:
             try:
-                hold_days = (datetime.now() - datetime.fromisoformat(r["buy_date"])).days
+                buy_dt = datetime.fromisoformat(r["buy_date"])
+                hold_days = (datetime.now() - buy_dt).days
+                is_pending = (r["buy_date"] == today_str)
             except Exception:
                 pass
         positions.append({
             "code": r["code"], "name": r["name"], "shares": r["shares"],
             "cost_nav": r["cost_nav"], "sector": r["sector"], "hold_days": hold_days,
+            "is_pending": is_pending,
         })
 
     funds = snap.get("funds", {}) or {}
@@ -141,6 +146,8 @@ def card_top(ctx, session):
     total_cost = 0.0
     total_value = 0.0
     for p in positions:
+        if p.get("is_pending"):
+            continue
         f = funds.get(p["code"]) or {}
         cur = f.get("current_nav", p["cost_nav"])
         dr = f.get("day_return", 0.0) or 0.0
@@ -234,6 +241,13 @@ def card_holdings(ctx):
     for p in positions:
         f = funds.get(p["code"]) or {}
         cur = f.get("current_nav", p["cost_nav"])
+        if p.get("is_pending"):
+            value = p["shares"] * cur
+            out.append(
+                f"| {_short_name(p['name'])} | -- | 待确认 | -- | "
+                f"-- | {value:,.0f} |"
+            )
+            continue
         dr = (f.get("day_return", 0.0) or 0.0)
         today_pnl = _today_pnl(p["shares"], cur, dr)
         value = p["shares"] * cur
@@ -457,31 +471,39 @@ def record_daily_snapshot(db, ctx, date):
     account_id = ctx["account_id"]
     total_value = ctx.get("total_value", 0.0)
     cash = ctx.get("cash", 0.0)
-    positions_value = total_value - cash
-    # 计算收益率：从 trades 表拿总投入成本
-    cost_total = sum(
-        p["shares"] * p["cost_nav"] for p in ctx.get("positions", [])
+    # 排除 pending 基金的市值
+    pending_value = sum(
+        p["shares"] * (ctx["funds"].get(p["code"], {}).get("current_nav", p["cost_nav"]))
+        for p in ctx.get("positions", [])
+        if p.get("is_pending")
     )
-    return_pct = ((total_value - cost_total) / cost_total * 100) if cost_total > 0 else 0.0
+    adjusted_total_value = total_value - pending_value
+    positions_value = adjusted_total_value - cash
+    # 计算收益率：只算已确认的持仓
+    confirmed_positions = [p for p in ctx.get("positions", []) if not p.get("is_pending")]
+    cost_total = sum(
+        p["shares"] * p["cost_nav"] for p in confirmed_positions
+    )
+    return_pct = ((adjusted_total_value - cost_total) / cost_total * 100) if cost_total > 0 else 0.0
     # 回撤：对比历史最高
     row = db.conn.execute(
         "SELECT MAX(total_value) AS peak FROM daily_snapshots WHERE account_id = ?",
         (account_id,),
     ).fetchone()
-    peak = (row["peak"] if row and row["peak"] else total_value)
-    drawdown = ((total_value - peak) / peak * 100) if peak > 0 else 0.0
+    peak = (row["peak"] if row and row["peak"] else adjusted_total_value)
+    drawdown = ((adjusted_total_value - peak) / peak * 100) if peak > 0 else 0.0
     market_regime = packet.get("market_regime", {}).get("label")
     sector_exposure = {}
-    for p in ctx.get("positions", []):
+    for p in confirmed_positions:
         sector = p.get("sector") or "未分类"
         funds = ctx.get("funds", {})
         f = funds.get(p["code"], {})
         val = p["shares"] * f.get("current_nav", p["cost_nav"])
         sector_exposure[sector] = sector_exposure.get(sector, 0.0) + val
     try:
-        db.add_snapshot(account_id, date, total_value, cash, positions_value,
+        db.add_snapshot(account_id, date, adjusted_total_value, cash, positions_value,
                         return_pct, drawdown, market_regime, sector_exposure)
-        print(f"[SNAPSHOT] {date} ¥{total_value:,.2f} ({return_pct:+.2f}%)")
+        print(f"[SNAPSHOT] {date} ¥{adjusted_total_value:,.2f} ({return_pct:+.2f}%)")
     except Exception as e:
         print(f"[WARN] 快照写入失败: {e}", file=sys.stderr)
 
