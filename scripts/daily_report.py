@@ -451,6 +451,41 @@ def _notify(account, action, code, name, amt, nav, shares, note):
         pass
 
 
+def record_daily_snapshot(db, ctx, date):
+    """将当日账户快照写入 daily_snapshots 表（幂等，同一天覆盖）。"""
+    packet = ctx.get("packet", {})
+    account_id = ctx["account_id"]
+    total_value = ctx.get("total_value", 0.0)
+    cash = ctx.get("cash", 0.0)
+    positions_value = total_value - cash
+    # 计算收益率：从 trades 表拿总投入成本
+    cost_total = sum(
+        p["shares"] * p["cost_nav"] for p in ctx.get("positions", [])
+    )
+    return_pct = ((total_value - cost_total) / cost_total * 100) if cost_total > 0 else 0.0
+    # 回撤：对比历史最高
+    row = db.conn.execute(
+        "SELECT MAX(total_value) AS peak FROM daily_snapshots WHERE account_id = ?",
+        (account_id,),
+    ).fetchone()
+    peak = (row["peak"] if row and row["peak"] else total_value)
+    drawdown = ((total_value - peak) / peak * 100) if peak > 0 else 0.0
+    market_regime = packet.get("market_regime", {}).get("label")
+    sector_exposure = {}
+    for p in ctx.get("positions", []):
+        sector = p.get("sector") or "未分类"
+        funds = ctx.get("funds", {})
+        f = funds.get(p["code"], {})
+        val = p["shares"] * f.get("current_nav", p["cost_nav"])
+        sector_exposure[sector] = sector_exposure.get(sector, 0.0) + val
+    try:
+        db.add_snapshot(account_id, date, total_value, cash, positions_value,
+                        return_pct, drawdown, market_regime, sector_exposure)
+        print(f"[SNAPSHOT] {date} ¥{total_value:,.2f} ({return_pct:+.2f}%)")
+    except Exception as e:
+        print(f"[WARN] 快照写入失败: {e}", file=sys.stderr)
+
+
 # ---------- 主流程 ----------
 
 def assemble(db, ctx, session, recorded, skipped=None):
@@ -498,6 +533,9 @@ def main():
             recorded = dca_done + recorded
 
         md = assemble(db, ctx, args.session, recorded, skipped)
+
+        # 记录每日快照（每次运行都写，盘尾最完整）
+        record_daily_snapshot(db, ctx, date)
         if args.print:
             print(md)
 
