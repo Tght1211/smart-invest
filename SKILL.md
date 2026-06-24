@@ -36,6 +36,8 @@ $ARGUMENTS
 | "我 XX 基金开了定投" | 配定投 | ❌ | ❌ |
 | "梦境训练"/"回测"/"模拟过去 N 个月" | E 回测 | ❌ | ❌ |
 | "基金排行"/"推荐基金" | 发现 | ❌ | ❌ |
+| "打开面板"/"看板"/"网页看持仓" | 启动 Web 面板 | ❌ | ❌ |
+| "关闭面板"/"停掉网页" | 关闭 Web 面板 | ❌ | ❌ |
 | 09:30 / 13:00 / 14:48 cron 触发 | A 开盘/盘中/盘尾卡片 | ✅ | ✅ |
 
 **反触发**：用户问 A 股个股、"股票分析"、非基金类话题 — 本 skill 不响应。
@@ -171,14 +173,22 @@ python3 scripts/db.py cash      --account 主线                 # 查现金（-
 3. **写订单**：`add-order --action sell`（同步回补现金）。
 4. **发交易通知邮件**。
 
-### 交易通知（强制，无例外）
+### 操作报告邮件（强制，无例外）
+
+每笔买/卖成交后**必须立即发**，且带**操作依据 + 新闻 + 操作后钱包**：
 
 ```bash
 python3 scripts/send_email.py trade-notify --action buy \
-  --code 512480 --name "半导体ETF国联安" --amount 5000 --nav 2.3432 --shares 2129.79 --note "低吸-半导体"
+  --code 512480 --name "半导体ETF国联安" --amount 5000 --nav 2.3432 --shares 2129.79 \
+  --note "低吸-半导体" \
+  --reason "引擎 low_buy 触发：当日跌3%、未追高；分散科技敞口" \
+  --news "半导体板块今日回调，国产替代政策催化" \
+  --wallet "总钱包 ¥53,734 ｜ 现金 ¥27,485 ｜ 持仓 ¥26,249"
 ```
 
-`--action buy` 或 `sell`。每笔买入/卖出完成后**必须立即发邮件**。
+- `--action buy`/`sell`；`--reason`=操作依据（引擎 `reason_zh` 或叙事），`--news` 可多次（每条一行，交互模式用 WebSearch 取当日新闻），`--wallet`=操作后钱包一行。
+- **可靠投递**：失败自动进程内重试 3 次 + 落 `data/outbox/` 队列，下次任何发信自动补发；手动补发 `send_email.py flush-outbox`。**邮件没发出去不再等于丢通知。**
+- 定时路（盘尾 `daily_report.py` 自动记账、定投）已自动带齐 reason/news/wallet，无需手动。
 
 ### 定投计划
 
@@ -194,14 +204,31 @@ python3 scripts/db.py dca remove --account 主线 --code 161725
 
 用户说"我 XX 基金开了定投，每月/每周投 X 元"→ 用 `dca add` 配置即可。
 
+### Web 面板（随时浏览器看）
+
+用户说"打开面板/看板/网页看持仓"时启动本地面板（与邮件同款卡片：钱包/持仓/收益/要闻/操作）：
+
+```bash
+python3 scripts/web_panel.py start --account 主线   # 后台启动，print URL（默认 http://127.0.0.1:8765/）
+python3 scripts/web_panel.py status                 # 看状态/URL
+python3 scripts/web_panel.py stop                   # 关闭（用户说"关闭面板"就调它）
+```
+
+把 URL 念给用户用浏览器打开；页面每 ~2 分钟自动刷新、可切换账户/时段。同局域网别的设备访问：`start --host 0.0.0.0`（**会暴露给同网段，提示用户注意安全**）。
+
+### 净值校准（已自动）& 当天买入待确认
+
+- **当天买入「待确认」**：场外基金 3 点前下单按当日收盘净值确认份额，**当天不该有收益**；当天买入的持仓在卡片/面板里显示「待确认」、按成本计、不计当日与累计盈亏，T+1 起算（`build_context` 的 `is_pending`）。
+- **净值校准（自动）**：`daily_report.py` 每时段开跑前自动把"按估值记的单笔新买入"在真实收盘净值公布后校准 cost_nav + 份额（只动单笔新买入，累计/导入持仓跳过）。手动：`python3 scripts/fetch_fund.py calibrate --account 主线 [--apply]`。
+
 ---
 
 ## 五、注意事项（硬规则）
 
 1. **决策权威只有 `decide.py` 引擎**——你不私自下买卖判断；改规则必须先过梦境实验室（见 `reference/analysis-and-backtest.md`）。
-2. **交易通知强制**：每笔买入/卖出后必须 `send_email.py trade-notify`，无例外。
+2. **操作报告邮件强制 + 必带新闻依据**：每笔买入/卖出后必须 `send_email.py trade-notify`，且带 `--reason`（为什么操作）+ `--news`（消息面，交互模式用 WebSearch）+ `--wallet`，无例外。发送失败自动重试 + 落 `data/outbox/` 队列下次补发，绝不丢通知。
 3. **数据来源**：天天基金/东方财富公开接口，仅供学习研究，不构成投资建议——每次报告带风险提示。
-4. **净值更新**：交易日 19:00-23:00 更新当日实际净值；盘中 `estimate` 是估值，与最终净值有 0.5-2% 差异。晚间公布后按晚报流程校准 cost_nav。
+4. **净值更新 & 校准**：交易日 19:00-23:00 更新当日实际净值；盘中 `estimate` 是估值，与最终净值有 0.5-2% 差异。当天买入显示「待确认」不计收益；真实净值公布后 `daily_report.py` 自动校准 cost_nav（见 §四）。
 5. **估值限制**：部分 ETF/QDII 无实时估值，引擎在 `alerts` 标 `data_missing`。
 6. **多账户**：所有 CLI 接受 `--account`；`主线`=实盘，`梦境-<sim_id>`=回测。
 7. **隐私**：持仓存本地 SQLite，不上传外部。

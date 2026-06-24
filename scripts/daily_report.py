@@ -87,10 +87,15 @@ def build_context(db, account, date):
         date=date, market_data=snap, positions=positions,
         cash=cash, total_value=total_value,
     )
+    try:
+        dca_plans = db.get_dca_plans(account_id, enabled_only=True)
+    except Exception:
+        dca_plans = []
     return {
         "packet": packet, "funds": funds, "positions": positions,
         "account_id": account_id, "total_value": total_value, "cash": cash,
-        "news": snap.get("news", []) or [],
+        "news": snap.get("news", []) or [], "account": account,
+        "dca_plans": dca_plans,
     }, None
 
 
@@ -159,6 +164,64 @@ def card_top(ctx, session):
     label = f"今日估算盈亏（{sess['label']} {sess['time']}）"
     stats = f"总市值 ¥{total_value:,.0f} | 累计 {_fmt_amt(cum)} | {cum_pct:+.2f}%"
     return [":::card", label, f"{total_today:+,.2f}元", stats, ":::", ""]
+
+
+def card_wallet(ctx):
+    """总钱包卡片：总钱包(持仓+现金) / 可用现金 / 现金储备线(10%) / 定投额度
+    + 总收益近30天迷你走势。收益口径与快照一致（已确认持仓的成本制浮盈）。"""
+    funds, positions = ctx["funds"], ctx["positions"]
+    cash = ctx.get("cash", 0.0) or 0.0
+    conf_mv = conf_cost = pend_cost = 0.0
+    for p in positions:
+        if p.get("is_pending"):
+            pend_cost += p["shares"] * p["cost_nav"]      # 待确认按成本计
+            continue
+        cur = (funds.get(p["code"]) or {}).get("current_nav", p["cost_nav"])
+        conf_mv += p["shares"] * cur
+        conf_cost += p["shares"] * p["cost_nav"]
+    pos_value = conf_mv + pend_cost
+    total_wallet = cash + pos_value
+    total_pnl = conf_mv - conf_cost                        # 已确认持仓浮盈
+    pnl_pct = (total_pnl / conf_cost * 100) if conf_cost else 0.0
+    reserve = total_wallet * 0.10
+    reserve_state = "充足" if cash >= reserve else "不足，慎再加仓"
+
+    out = [
+        ":::card",
+        "总钱包（持仓 + 现金）",
+        f"¥{total_wallet:,.0f}",
+        f"持仓 ¥{pos_value:,.0f} | 现金 ¥{cash:,.0f} | "
+        f"总收益 {_fmt_amt(total_pnl)} ({pnl_pct:+.2f}%)",
+        ":::",
+        "",
+        "### 现金 & 额度",
+        f"- 可用现金：¥{cash:,.0f}",
+        f"- 现金储备线(10%)：¥{reserve:,.0f}（{reserve_state}）",
+    ]
+    plans = ctx.get("dca_plans") or []
+    if plans:
+        quota = "；".join(
+            f"¥{(pl['amount'] or 0):,.0f}/{pl.get('frequency', '')} "
+            f"{_short_name(pl.get('name') or pl.get('code', ''))}"
+            for pl in plans
+        )
+        out.append(f"- 定投额度：{quota}")
+    out.append("")
+
+    # 总收益变化迷你走势（净值派生，红涨绿跌）
+    try:
+        series = fetch_fund.portfolio_return_series(ctx.get("account"), days=30)
+    except Exception:
+        series = []
+    if series and len(series) >= 2:
+        vals = [round(p * 100, 2) for _, p in series]
+        latest = vals[-1]
+        sign = "+" if latest >= 0 else ""
+        csv = ",".join(f"{v:.2f}" for v in vals)
+        out += [":::spark",
+                f"总收益走势（近30天，持仓） | {sign}{latest:.2f}%",
+                csv, ":::", ""]
+    return out
 
 
 def card_action(ctx, session, recorded, skipped=None):
@@ -412,7 +475,11 @@ def auto_record(db, ctx, account, do_email=True):
             _adjust_cash(db, account_id, -amt)
             recorded.append(f"买入「{_short_name(name)}」¥{amt:,.0f}（支付宝搜 {code}）")
             if do_email:
-                _notify(account, "buy", code, name, amt, nav, shares, a.get("rule_label", ""))
+                news = fetch_fund.relevant_news(ctx.get("news") or [],
+                                                name=name, sector=a.get("sector"))
+                _notify(account, "buy", code, name, amt, nav, shares,
+                        a.get("rule_label", ""), reason=a.get("reason_zh"),
+                        news=news, wallet=_wallet_line(db, account_id, "buy", amt))
         elif a["action"] == "sell":
             shares = a.get("suggested_shares") or 0.0
             if shares <= 0 or nav <= 0:
@@ -430,7 +497,11 @@ def auto_record(db, ctx, account, do_email=True):
             _adjust_cash(db, account_id, amt)
             recorded.append(f"卖出「{_short_name(name)}」约 {shares:,.0f} 份（¥{amt:,.0f}）")
             if do_email:
-                _notify(account, "sell", code, name, amt, nav, shares, a.get("rule_label", ""))
+                news = fetch_fund.relevant_news(ctx.get("news") or [],
+                                                name=name, sector=a.get("sector"))
+                _notify(account, "sell", code, name, amt, nav, shares,
+                        a.get("rule_label", ""), reason=a.get("reason_zh"),
+                        news=news, wallet=_wallet_line(db, account_id, "sell", amt))
     return recorded, skipped
 
 
@@ -452,15 +523,35 @@ def _accum_shares(db, account_id, code, add):
     return (row["shares"] if row else 0.0) + add
 
 
-def _notify(account, action, code, name, amt, nav, shares, note):
+def _wallet_line(db, account_id, action, amt):
+    """操作后钱包一行（读最新现金；现金已由 _adjust_cash 联动）。"""
+    row = db.conn.execute(
+        "SELECT cash FROM accounts WHERE id = ?", (account_id,)
+    ).fetchone()
+    cash = (row["cash"] if row else 0.0) or 0.0
+    flow = "买入扣" if action == "buy" else "卖出加"
+    return f"现金 ¥{cash:,.0f}（本次{flow} ¥{amt:,.0f}）"
+
+
+def _notify(account, action, code, name, amt, nav, shares, note,
+            reason=None, news=None, wallet=None):
+    """发交易操作报告邮件（强制，每笔买卖必发）。携带操作依据 + 相关要闻 + 操作后钱包。"""
     import subprocess
+    cmd = [
+        sys.executable, str(SCRIPT_DIR / "send_email.py"), "trade-notify",
+        "--action", action, "--code", code, "--name", name,
+        "--amount", f"{amt:.2f}", "--nav", f"{nav:.4f}",
+        "--shares", f"{shares:.2f}", "--note", note or "",
+    ]
+    if reason:
+        cmd += ["--reason", reason]
+    for n in (news or []):
+        if n:
+            cmd += ["--news", n]
+    if wallet:
+        cmd += ["--wallet", wallet]
     try:
-        subprocess.run([
-            sys.executable, str(SCRIPT_DIR / "send_email.py"), "trade-notify",
-            "--action", action, "--code", code, "--name", name,
-            "--amount", f"{amt:.2f}", "--nav", f"{nav:.4f}",
-            "--shares", f"{shares:.2f}", "--note", note or "",
-        ], check=False, timeout=40)
+        subprocess.run(cmd, check=False, timeout=40)
     except Exception:
         pass
 
@@ -513,6 +604,7 @@ def record_daily_snapshot(db, ctx, date):
 def assemble(db, ctx, session, recorded, skipped=None):
     md = []
     md += card_top(ctx, session)
+    md += card_wallet(ctx)              # 总钱包：持仓+现金/额度/总收益走势
     md += card_spark(ctx)               # 纳指隔夜（QDII 当日方向）
     md += card_action(ctx, session, recorded, skipped)
     md += card_position(ctx)
@@ -539,6 +631,16 @@ def main():
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     db = Database()
     try:
+        # 自动净值校准：昨日按估值记的单笔新买入，待真实收盘净值公布后修正成本/份额。
+        # 预览(--html)/不记账(--no-record) 视为只读，不写库。
+        if not (args.no_record or args.html):
+            calib = fetch_fund.calibrate_costs(args.account, apply=True)
+            applied = [c for c in calib if c.get("status") == "applied"]
+            if applied:
+                print("[OK] 净值校准 " + "；".join(
+                    f"{_short_name(c['name'])} {c['old_nav']:.4f}→{c['new_nav']:.4f}"
+                    for c in applied))
+
         ctx, err = build_context(db, args.account, date)
         if err:
             print(f"[ERROR] {err}", file=sys.stderr)

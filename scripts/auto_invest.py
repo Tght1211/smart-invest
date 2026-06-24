@@ -141,6 +141,7 @@ def _notify(account, code, name, amount, nav, shares):
             "--action", "buy", "--code", code, "--name", name,
             "--amount", f"{amount:.2f}", "--nav", f"{nav:.4f}",
             "--shares", f"{shares:.2f}", "--note", "定投",
+            "--reason", "定投计划自动扣款（已委托，按周期到期执行）",
         ], check=False, timeout=40)
     except Exception:
         pass

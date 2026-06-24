@@ -187,6 +187,62 @@ def gather_market_news(keyword=None, limit=10):
     return items[:limit]
 
 
+# 基金名/赛道里对新闻匹配无意义的通用词，先剔除
+_NEWS_STOPWORDS = ("ETF联接", "ETF", "指数", "(QDII)", "QDII", "联接", "基金",
+                   "股票", "混合", "LOF", "A", "C")
+
+# 常见赛道/主题词——基金名常把它嵌在公司前缀后（如「国联安半导体」），
+# 中文无 stdlib 分词，靠这张表把主题抠出来与新闻匹配。
+_THEME_KEYWORDS = (
+    "半导体", "集成电路", "芯片", "白酒", "消费", "医药", "生物", "创新药",
+    "新能源", "光伏", "锂电", "电池", "储能", "科技", "券商", "证券", "银行",
+    "军工", "国防", "纳斯达克", "纳指", "标普", "美股", "黄金", "有色",
+    "中证500", "中证1000", "沪深300", "上证50", "创业板", "科创",
+    "人工智能", "算力", "通信", "传媒", "电子", "汽车", "地产", "金融",
+)
+
+
+def _news_keywords(name=None, sector=None):
+    """从基金名 + 赛道提炼用于匹配新闻的关键词（主题词 + 粗粒度子串）。"""
+    kws = []
+    blob = " ".join(str(x) for x in (sector, name) if x)
+    for theme in _THEME_KEYWORDS:
+        if theme in blob:
+            kws.append(theme)
+    for raw in (sector, name):
+        if not raw:
+            continue
+        s = str(raw)
+        for w in _NEWS_STOPWORDS:
+            s = s.replace(w, " ")
+        for tok in s.replace("/", " ").split():
+            tok = tok.strip()
+            if len(tok) >= 2 and not tok.isdigit() and tok not in kws:
+                kws.append(tok)
+    return kws
+
+
+def relevant_news(news, name=None, sector=None, limit=3):
+    """从 news 列表挑与某基金相关的要闻（按名/赛道关键词子串匹配）。
+
+    无命中则回退 top 市场要闻——保证「每笔操作都有新闻支撑」。返回标题字符串列表。
+    交互模式下 Claude 可用 WebSearch 拿更精准的新闻，本函数是定时/无 LLM 路兜底。
+    """
+    if not news:
+        return []
+    kws = _news_keywords(name, sector)
+    hits = []
+    for it in news:
+        text = (it.get("title", "") or "") + " " + (it.get("summary", "") or "")
+        if any(k in text for k in kws):
+            t = it.get("title", "")
+            if t and t not in hits:
+                hits.append(t)
+    if not hits:
+        hits = [it.get("title", "") for it in news if it.get("title", "")]
+    return hits[:limit]
+
+
 def cmd_news(args):
     """免费财经快讯（可 --keyword 过滤）"""
     items = gather_market_news(keyword=args.keyword, limit=args.limit)
@@ -1042,6 +1098,121 @@ def cmd_returns(args):
     print()
 
 
+def _buy_unconfirmed(buy_date, ref=None):
+    """当天（或更晚）买入 → 份额/净值未确认（与 daily_report 的 is_pending 同义）。"""
+    if not buy_date:
+        return False
+    ref = ref or datetime.now()
+    s = str(buy_date)[:10]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date() >= ref.date()
+        except ValueError:
+            continue
+    return False
+
+
+def portfolio_return_series(account_name=None, days=30):
+    """组合「总收益率」时间序列 [(date, pct)]（净值派生，含迷你走势用）。
+
+    复用 _align_total_return_series；当天买入（未确认）排除，避免其历史净值扭曲曲线。
+    无持仓或无净值返回 []。供邮件钱包卡片 / Web 面板 / CLI 共用。
+    """
+    portfolio = _load_portfolio(account_name)
+    if not portfolio:
+        return []
+    holdings = []
+    for h in portfolio:
+        if _buy_unconfirmed(h.get("buy_date")):
+            continue
+        series = fetch_nav_series(h.get("code", ""), days=days)
+        holdings.append((h.get("shares", 0), h.get("cost_nav", 0), series))
+    return _align_total_return_series(holdings)
+
+
+def calibrate_costs(account_name, apply=False):
+    """把"按盘中估值记录"的最近买入校准到**实际收盘净值**（份额+成本一起改）。
+
+    场外基金按收盘净值确认份额：记账当时只有估值，晚间真实净值公布后会有偏差。
+    本函数等真实净值出来后把这笔买入的 cost_nav 与 shares 修正到真实值。
+    **安全闸**：只动"单笔新买入"的持仓（持仓 shares/cost 恰好等于最近一笔买入），
+    累计/导入（无对应买单或已多次加仓）的持仓一律跳过、只报告——绝不乱改成本基准。
+
+    apply=False 仅预览；返回每只的校准明细。幂等：校准后把该买单 nav/shares 改真实值
+    并标 outcome=nav_calibrated，下次不再重复。
+    """
+    if not (DB_AVAILABLE and account_name):
+        return []
+    db = Database()
+    try:
+        account = db.get_account(name=account_name)
+        if not account:
+            return []
+        aid = account["id"]
+        trades = db.get_trades(aid)   # 已按 date DESC, id DESC
+        out = []
+        for p in db.get_positions(aid):
+            code, shares, cost = p["code"], p["shares"], p["cost_nav"]
+            buys = [t for t in trades if t["code"] == code and t["action"] == "buy"]
+            if not buys:
+                continue
+            last = buys[0]
+            tdate = str(last["date"])[:10]
+            if _buy_unconfirmed(tdate):             # 当天净值还没公布，等下次
+                continue
+            amount, rec_nav, rec_shares = (last["amount"] or 0.0), (last["nav"] or 0.0), (last["shares"] or 0.0)
+            if amount <= 0 or rec_nav <= 0:
+                continue
+            series = dict((str(d)[:10], nav) for d, nav in fetch_nav_series(code, days=15))
+            real = series.get(tdate)
+            if not real or real <= 0:               # 还没拿到那天的真实净值
+                continue
+            if abs(real - rec_nav) / rec_nav < 0.0005:   # 已经准确（含已校准过的）
+                continue
+            single_lot = (abs(shares - rec_shares) <= max(0.01, rec_shares * 0.001)
+                          and abs(cost - rec_nav) < 1e-6)
+            if not single_lot:
+                out.append({"code": code, "name": p["name"], "status": "skip_accumulated",
+                            "old_nav": rec_nav, "new_nav": real, "date": tdate})
+                continue
+            new_shares = round(amount / real, 2)
+            entry = {"code": code, "name": p["name"],
+                     "status": "applied" if apply else "preview",
+                     "old_nav": rec_nav, "new_nav": real,
+                     "old_shares": rec_shares, "new_shares": new_shares, "date": tdate}
+            if apply:
+                db.set_position(aid, code, p["name"], new_shares, real,
+                                buy_date=p.get("buy_date"), sector=p.get("sector"),
+                                note=p.get("note"))
+                db.conn.execute(
+                    "UPDATE trades SET nav=?, shares=?, outcome='nav_calibrated' WHERE id=?",
+                    (real, new_shares, last["id"]))
+                db.conn.commit()
+            out.append(entry)
+        return out
+    finally:
+        db.close()
+
+
+def cmd_calibrate(args):
+    """校准按估值记录的最近买入到真实净值（默认预览，--apply 写入）。"""
+    rows = calibrate_costs(args.account, apply=args.apply)
+    if not rows:
+        print("无可校准的买入（要么净值未公布，要么已准确）。")
+        return
+    verb = "已校准" if args.apply else "待校准（预览，加 --apply 写入）"
+    print(f"\n净值校准 — 账户 {args.account}：{verb}")
+    print("-" * 72)
+    for r in rows:
+        if r["status"] == "skip_accumulated":
+            print(f"  ⏭  {r['name']}（{r['code']}）累计/导入持仓，跳过："
+                  f"估值 {r['old_nav']:.4f} → 实际 {r['new_nav']:.4f}，请手动核对")
+            continue
+        print(f"  ✓  {r['name']}（{r['code']}）{r['date']}：净值 {r['old_nav']:.4f}→{r['new_nav']:.4f}，"
+              f"份额 {r['old_shares']:.2f}→{r['new_shares']:.2f}")
+    print()
+
+
 def cmd_orders_show(args):
     """显示交易订单"""
     account_name = getattr(args, 'account', None)
@@ -1514,6 +1685,11 @@ def main():
     p_ret.add_argument("--code", "-c", help="只看单只基金代码")
     p_ret.add_argument("--days", "-d", type=int, default=30, help="回看天数（默认30）")
 
+    # calibrate — 把按估值记的买入校准到真实收盘净值
+    p_cal = sub.add_parser("calibrate", help="把按估值记的最近买入校准到真实净值（默认预览，--apply 写入）")
+    p_cal.add_argument("--account", "-a", required=True, help="账户名称")
+    p_cal.add_argument("--apply", action="store_true", help="写入数据库（不加则仅预览）")
+
     # news — 免费财经快讯
     p_news = sub.add_parser("news", help="免费财经快讯（东方财富7x24，可--keyword过滤）")
     p_news.add_argument("--keyword", "-k", help="按关键词过滤（如 半导体/纳指/降准）")
@@ -1549,6 +1725,7 @@ def main():
         "portfolio-show": cmd_portfolio_show,
         "orders-show": cmd_orders_show,
         "returns": cmd_returns,
+        "calibrate": cmd_calibrate,
         "news": cmd_news,
         "market-summary": cmd_market_summary,
         "market-snapshot": cmd_market_snapshot,

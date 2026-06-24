@@ -139,6 +139,7 @@ class DecisionEngine:
         actions, blocked, alerts = self._evaluate_rules(
             date, market_data, positions, snapshot, regime, cash, total_value,
         )
+        self._attach_news(actions, market_data)
 
         return {
             "schema_version": "1.0",
@@ -154,6 +155,27 @@ class DecisionEngine:
             "alerts": alerts,
             "summary": self._build_summary(actions),
         }
+
+    def _attach_news(self, actions, market_data):
+        """给 buy/sell action 附加相关要闻到 context["news"]（additive，不驱动决策）。
+
+        与 context["signals"] 同款——仅观测/报告用，让「为什么操作」带上消息面。
+        market_data 无 news 时（如单测 fixture）此函数无副作用。
+        """
+        news = (market_data or {}).get("news") or []
+        if not news:
+            return
+        try:
+            from fetch_fund import relevant_news
+        except Exception:
+            return
+        for a in actions:
+            if a.get("action") not in ("buy", "sell"):
+                continue
+            sector = self.get_fund_sector(a.get("code", ""), a.get("name", ""))
+            rel = relevant_news(news, name=a.get("name"), sector=sector, limit=3)
+            if rel:
+                a.setdefault("context", {})["news"] = rel
 
     def _compute_market_regime(self, market_data):
         """Classify market regime by HS300 20-day return.

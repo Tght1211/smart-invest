@@ -6,6 +6,9 @@ data/orders.json
 data/snapshot.json
 data/config.json
 data/simulations/
+data/outbox/
+data/web_panel.pid
+data/web_panel.log
 
 # Python
 __pycache__/
@@ -13,6 +16,7 @@ __pycache__/
 
 # Reports (generated)
 reports/*.md
+reports/*.html
 
 # OS
 .DS_Store

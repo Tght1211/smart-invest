@@ -9,12 +9,15 @@ import argparse
 import json
 import smtplib
 import sys
+import time
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CONFIG_FILE = DATA_DIR / "email_config.json"
+OUTBOX_DIR = DATA_DIR / "outbox"   # 发失败的邮件落盘待发，下次自动补发
 
 
 def load_config():
@@ -501,43 +504,120 @@ def markdown_to_html(md_text):
 </html>"""
 
 
-def send_email(subject, body_text, html_body=None):
-    """发送邮件"""
-    config = load_config()
-    if not config:
-        return False
-
-    smtp_conf = config["smtp"]
-
+def _build_msg(subject, body_text, html_body, sender, receivers):
     msg = MIMEMultipart("alternative")
-    receivers = smtp_conf["receiver"]
-    if isinstance(receivers, str):
-        receivers = [receivers]
-
-    msg["From"] = smtp_conf["sender"]
+    msg["From"] = sender
     msg["To"] = ", ".join(receivers)
     msg["Subject"] = subject
-
-    msg.attach(MIMEText(body_text, "plain", "utf-8"))
-
+    msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
 
-    try:
-        if smtp_conf.get("use_ssl", True):
-            server = smtplib.SMTP_SSL(smtp_conf["server"], smtp_conf["port"], timeout=30)
-        else:
-            server = smtplib.SMTP(smtp_conf["server"], smtp_conf["port"], timeout=30)
-            server.starttls()
 
-        server.login(smtp_conf["sender"], smtp_conf["password"])
-        server.sendmail(smtp_conf["sender"], receivers, msg.as_string())
-        server.quit()
-        print(f"[OK] 邮件已发送至 {', '.join(receivers)}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] 邮件发送失败: {e}", file=sys.stderr)
+def _smtp_send(smtp_conf, receivers, msg, retries=3):
+    """单封邮件的 SMTP 投递 + 进程内重试（指数退避 1/2/4s）。返回 bool，绝不抛异常。"""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            if smtp_conf.get("use_ssl", True):
+                server = smtplib.SMTP_SSL(smtp_conf["server"], smtp_conf["port"], timeout=30)
+            else:
+                server = smtplib.SMTP(smtp_conf["server"], smtp_conf["port"], timeout=30)
+                server.starttls()
+            server.login(smtp_conf["sender"], smtp_conf["password"])
+            server.sendmail(smtp_conf["sender"], receivers, msg.as_string())
+            server.quit()
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    print(f"[ERROR] 邮件发送失败（已重试 {retries} 次）: {last_err}", file=sys.stderr)
+    return False
+
+
+def _deliver(subject, body_text, html_body, receivers, config=None):
+    """投递一封邮件（含进程内重试）。不碰 outbox、不递归 flush。返回 bool。"""
+    config = config or load_config()
+    if not config:
         return False
+    smtp_conf = config["smtp"]
+    rcv = receivers or smtp_conf["receiver"]
+    if isinstance(rcv, str):
+        rcv = [rcv]
+    msg = _build_msg(subject, body_text, html_body, smtp_conf["sender"], rcv)
+    ok = _smtp_send(smtp_conf, rcv, msg)
+    if ok:
+        print(f"[OK] 邮件已发送至 {', '.join(rcv)}")
+    return ok
+
+
+def _enqueue_outbox(subject, body_text, html_body, receivers):
+    """投递失败时落盘到 data/outbox/，下次任何发信前自动补发。"""
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    n = len(list(OUTBOX_DIR.glob("*.json")))
+    fp = OUTBOX_DIR / f"{ts}-{n:03d}.json"
+    rcv = receivers if isinstance(receivers, list) else [receivers]
+    fp.write_text(json.dumps({
+        "subject": subject, "body_text": body_text, "html": html_body,
+        "receivers": rcv, "created_at": datetime.now().isoformat(timespec="seconds"),
+    }, ensure_ascii=False), encoding="utf-8")
+    print(f"[WARN] 邮件发送失败，已存入待发队列 {fp.name}，下次运行将自动补发", file=sys.stderr)
+    return fp
+
+
+def flush_outbox(config=None):
+    """补发 data/outbox/ 里积压的邮件，成功则删文件。返回补发数量。"""
+    if not OUTBOX_DIR.exists():
+        return 0
+    files = sorted(OUTBOX_DIR.glob("*.json"))
+    if not files:
+        return 0
+    config = config or load_config()
+    if not config:
+        return 0
+    sent = 0
+    for fp in files:
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            fp.unlink(missing_ok=True)   # 损坏的队列文件直接丢弃
+            continue
+        ok = _deliver(data.get("subject", ""), data.get("body_text", ""),
+                      data.get("html"), data.get("receivers"), config)
+        if ok:
+            fp.unlink(missing_ok=True)
+            sent += 1
+        else:
+            break   # 还发不出去，保留全部，留待下次
+    if sent:
+        print(f"[OK] 已补发积压邮件 {sent} 封")
+    return sent
+
+
+def send_email(subject, body_text, html_body=None):
+    """发送邮件：先补发积压队列 → 投递（含重试）→ 失败落盘待发。"""
+    config = load_config()
+    if not config:
+        return False   # 邮件未配置/已关闭：不入队，避免无意义堆积
+    flush_outbox(config)
+    rcv = config["smtp"]["receiver"]
+    if isinstance(rcv, str):
+        rcv = [rcv]
+    ok = _deliver(subject, body_text, html_body, rcv, config)
+    if not ok:
+        _enqueue_outbox(subject, body_text, html_body, rcv)
+    return ok
+
+
+def cmd_flush_outbox(args):
+    """手动补发待发队列（cron 可定期调）"""
+    n = flush_outbox()
+    if n == 0:
+        pending = len(list(OUTBOX_DIR.glob("*.json"))) if OUTBOX_DIR.exists() else 0
+        print(f"无可补发邮件（队列积压 {pending} 封，可能邮件未配置或仍发不出）")
 
 
 def cmd_send(args):
@@ -559,55 +639,44 @@ def cmd_send(args):
 
 
 def cmd_trade_notify(args):
-    """发送交易通知邮件"""
-    from datetime import datetime
-
+    """发送交易操作报告邮件（每笔买卖强制；含操作依据 + 相关要闻 + 操作后钱包）"""
     action_cn = "买入" if args.action == "buy" else "卖出"
     emoji = "🟢" if args.action == "buy" else "🔴"
+    amount = float(args.amount)
 
-    subject = f"{emoji} 交易通知 - {action_cn} {args.name}({args.code})"
+    subject = f"{emoji} 操作报告 - {action_cn}「{args.name}」¥{amount:,.0f}"
 
-    # 计算当前持仓价值
-    position_value = float(args.amount)
+    reason = (getattr(args, "reason", None) or args.note or "").strip()
+    news = [n.strip() for n in (getattr(args, "news", None) or []) if n and n.strip()]
+    wallet = (getattr(args, "wallet", None) or "").strip()
 
-    body = f"""Smart Invest 交易通知
+    parts = [
+        ":::card",
+        f"{action_cn}操作已完成",
+        f"¥{amount:,.0f}",
+        f"{args.code} {args.name} | {float(args.shares):,.2f} 份 @ "
+        f"¥{float(args.nav):.4f} | {datetime.now().strftime('%m-%d %H:%M')}",
+        ":::",
+        "",
+        "### 📋 操作依据",
+        reason if reason else "（未提供操作依据——按规范每笔操作都应说明原因）",
+        "",
+        "### 📰 相关要闻",
+    ]
+    if news:
+        parts += [f"- {n}" for n in news[:5]]
+    else:
+        parts.append("- （本次未附带新闻，建议补充操作的消息面依据）")
+    parts.append("")
+    if wallet:
+        parts += ["### 💰 操作后钱包", wallet, ""]
+    parts += [
+        "### 提示",
+        "- 买入 T+1 确认份额，QDII 可能 T+2；可在支付宝查看订单状态",
+        "- ⚠️ 投资有风险，入市需谨慎。",
+    ]
 
-{action_cn}操作已完成
-
-━━━━━━━━━━━━━━━━━━━━━━
-基金信息
-━━━━━━━━━━━━━━━━━━━━━━
-基金代码: {args.code}
-基金名称: {args.name}
-交易方向: {action_cn}
-交易金额: ¥{float(args.amount):,.2f}
-成交净值: ¥{float(args.nav):.4f}
-交易份额: {float(args.shares):.2f} 份
-交易时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-━━━━━━━━━━━━━━━━━━━━━━
-当前持仓
-━━━━━━━━━━━━━━━━━━━━━━
-持仓市值: ¥{position_value:,.2f}
-"""
-
-    if args.note:
-        body += f"备注: {args.note}\n"
-
-    body += f"""
-━━━━━━━━━━━━━━━━━━━━━━
-提示
-━━━━━━━━━━━━━━━━━━━━━━
-• 买入订单将在 T+1 确认份额
-• QDII 基金确认时间可能为 T+2
-• 可在支付宝查看订单状态
-• 每日 14:30 收到投资分析日报
-• 每周五 16:00 收到投资周报
-• 每月最后一天 17:00 收到投资月报
-
-⚠️ 投资有风险，入市需谨慎。
-"""
-
+    body = "\n".join(parts)
     html = markdown_to_html(body)
     send_email(subject, body, html)
 
@@ -743,9 +812,15 @@ def main():
     p_trade.add_argument("--amount", required=True, help="交易金额")
     p_trade.add_argument("--nav", required=True, help="成交净值")
     p_trade.add_argument("--shares", required=True, help="交易份额")
-    p_trade.add_argument("--note", default="", help="备注")
+    p_trade.add_argument("--note", default="", help="备注（规则名，无 --reason 时作操作依据）")
+    p_trade.add_argument("--reason", help="操作依据（为什么买/卖，引擎 reason_zh 或叙事）")
+    p_trade.add_argument("--news", action="append", default=[],
+                         help="相关要闻（可多次传入，每次一条）")
+    p_trade.add_argument("--wallet", help="操作后钱包一行（如 总 ¥X｜现金 ¥Y）")
 
     sub.add_parser("test", help="发送测试邮件")
+
+    sub.add_parser("flush-outbox", help="补发待发队列里发失败的邮件")
 
     p_setup = sub.add_parser("setup", help="配置邮件")
     p_setup.add_argument("--sender", help="发件邮箱")
@@ -780,6 +855,8 @@ def main():
         cmd_setup(args)
     elif args.command == "check":
         cmd_check(args)
+    elif args.command == "flush-outbox":
+        cmd_flush_outbox(args)
 
 
 if __name__ == "__main__":
