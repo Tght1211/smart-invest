@@ -75,6 +75,147 @@ def is_otc(code, name):
     return fund_venue(code, name) == "场外"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 会话对表（R1）：本机时间 / 时区 / 星期 / A股交易时段判定（纯函数，可注入 now）
+# ──────────────────────────────────────────────────────────────────────
+_WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def market_clock(now=None):
+    """返回本机当前时间、时区与 A 股交易时段判定。
+
+    纯函数：传入 `now`（带时区的 datetime）即可离线测试。
+    时段键 session_key ∈ {pre, open, lunch, mid, close, after, weekend}，
+    其中 open/mid/close 对应三时段日报。
+    注意：只按周末判断非交易日，**不含法定节假日**（节假日历需联网，故从略，
+    遇节假日请人工核对）。
+    """
+    if now is None:
+        now = datetime.now().astimezone()
+    elif now.tzinfo is None:
+        now = now.astimezone()
+
+    wd = now.weekday()  # 0=周一
+    is_weekend = wd >= 5
+    minutes = now.hour * 60 + now.minute
+
+    off = now.utcoffset()
+    if off is not None:
+        total = int(off.total_seconds() // 60)
+        sign = "+" if total >= 0 else "-"
+        total = abs(total)
+        utc_offset = f"{sign}{total // 60:02d}:{total % 60:02d}"
+    else:
+        utc_offset = ""
+
+    if is_weekend:
+        session, key, market_open = "周末休市", "weekend", False
+    elif minutes < 9 * 60:
+        session, key, market_open = "盘前", "pre", False
+    elif minutes < 9 * 60 + 30:
+        session, key, market_open = "集合竞价（盘前）", "pre", False
+    elif minutes < 11 * 60 + 30:
+        session, key, market_open = "上午盘", "open", True
+    elif minutes < 13 * 60:
+        session, key, market_open = "午间休市", "lunch", False
+    elif minutes < 14 * 60 + 30:
+        session, key, market_open = "下午盘", "mid", True
+    elif minutes < 15 * 60:
+        session, key, market_open = "盘尾下单窗口", "close", True
+    else:
+        session, key, market_open = "已收盘", "after", False
+
+    advice = {
+        "pre": "A股尚未开盘。可先做隔夜复盘、看 QDII 方向（纳指隔夜）和今日计划。",
+        "open": "A股上午盘交易中。盘中估值仅供参考，下单决策留到盘尾 14:30。",
+        "lunch": "午间休市。可整理上午行情、准备下午策略。",
+        "mid": "A股下午盘交易中。临近盘尾，准备最终下单决策。",
+        "close": "正处盘尾下单窗口（14:30-15:00），场外基金约 15:00 截单，现在是当日最终买卖决策时刻——留足 30 分钟确认。",
+        "after": "A股已收盘。当日场外按收盘净值成交；适合做收盘复盘、记账与晚报。",
+        "weekend": "周末休市，无法交易。可做策略复盘、回测与持仓体检。",
+    }[key]
+
+    return {
+        "now": now.isoformat(timespec="seconds"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "tzname": now.tzname() or "",
+        "utc_offset": utc_offset,
+        "weekday": wd + 1,
+        "weekday_zh": "周" + _WEEKDAY_ZH[wd],
+        "is_weekend": is_weekend,
+        "is_trading_day": not is_weekend,  # 不含法定节假日
+        "session": session,
+        "session_key": key,
+        "market_open": market_open,
+        "advice": advice,
+    }
+
+
+def cmd_now(args):
+    """打印本机时间/时区/星期 + A股交易时段（会话开始先对表）。"""
+    c = market_clock()
+    if getattr(args, "json", False):
+        print(json.dumps(c, ensure_ascii=False, indent=2))
+        return
+    print(f"\n🕐 本机时间：{c['date']} {c['weekday_zh']} {c['time']}"
+          f"（{c['tzname']} UTC{c['utc_offset']}）")
+    print(f"📅 交易日：{'是' if c['is_trading_day'] else '否（周末）'}"
+          f"｜当前时段：{c['session']}"
+          f"｜A股{'开市中' if c['market_open'] else '未开市'}")
+    print(f"💡 {c['advice']}")
+    if c["is_trading_day"]:
+        print("（注：仅按周末判断，法定节假日请人工核对）")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 份额类型识别（R5 短期买C·长期买A）：纯函数，无网络
+# ──────────────────────────────────────────────────────────────────────
+_CLASS_LETTERS = ("A", "B", "C", "D", "E")
+_PAREN_RE = re.compile(r"[（(][^（()）]*[）)]")
+
+
+def detect_share_class(name):
+    """从基金名识别份额类别 → 'A'/'B'/'C'/'D'/'E' 或 None（单一份额/无后缀）。
+
+    纯字符串启发：去掉尾部括注（如「(QDII)」「人民币」修饰保留），
+    再看结尾是否为类别字母或「X类」。例：
+      「广发纳斯达克100ETF联接人民币(QDII)C」→ C
+      「招商中证白酒指数A」→ A
+      「汇丰晋信科技先锋股票」→ None（无份额后缀）
+    """
+    if not name:
+        return None
+    s = name.strip()
+    # 「…A类」「…C类」
+    m = re.search(r"([ABCDE])\s*类$", s)
+    if m:
+        return m.group(1)
+    # 去掉尾部成对括注后看结尾字母
+    prev = None
+    while prev != s:
+        prev = s
+        s = _PAREN_RE.sub("", s).strip()
+    if len(s) >= 2 and s[-1] in _CLASS_LETTERS and not s[-2].isdigit():
+        # 排除「ETF」结尾的 F 等：F 不在集合里；A-E 结尾基本就是份额
+        return s[-1]
+    return None
+
+
+def base_fund_name(name):
+    """去掉尾部份额类别字母，得到兄弟份额共享的基名（纯函数）。
+
+    用于匹配 A/C 兄弟：「…联接人民币(QDII)C」→「…联接人民币(QDII)」。
+    """
+    if not name:
+        return ""
+    s = name.strip()
+    s = re.sub(r"\s*([ABCDE])\s*类$", "", s)
+    if len(s) >= 2 and s[-1] in _CLASS_LETTERS and not s[-2].isdigit():
+        s = s[:-1]
+    return s.strip()
+
+
 def _get(url, headers=None, retries=2):
     """通用 HTTP GET 请求，带重试"""
     req_headers = dict(HEADERS)
@@ -586,6 +727,137 @@ def cmd_us_index(args):
     print(f"{res['name']}  {res['price']}  {sign}{pct}%  → 对应 QDII 今日预计{arrow}")
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 板块多窗口扫描（R2）：今日热门/落后板块 + 7日/30日/6月波动 + 趋势分类
+# ──────────────────────────────────────────────────────────────────────
+def compute_window_returns(closes):
+    """收盘序列（oldest→newest）→ 多窗口收益 + 30日波动率（纯函数，百分比）。
+
+    d1≈今日, d5≈近一周, d22≈近一月, d120≈近半年（按交易日近似）。
+    """
+    def ret(n):
+        if len(closes) > n and closes[-1 - n]:
+            return round((closes[-1] / closes[-1 - n] - 1) * 100, 2)
+        return None
+
+    vol30 = None
+    if len(closes) >= 22:
+        seg = closes[-22:]
+        rets = [(seg[i] / seg[i - 1] - 1) for i in range(1, len(seg)) if seg[i - 1]]
+        if rets:
+            mean = sum(rets) / len(rets)
+            vol30 = round((sum((r - mean) ** 2 for r in rets) / len(rets)) ** 0.5 * 100, 2)
+    return {"d1": ret(1), "d5": ret(5), "d22": ret(22), "d120": ret(120), "vol30": vol30}
+
+
+def classify_board_trend(w):
+    """据多窗口收益分类板块趋势（纯函数）→ (label, note)。
+
+    把「今日的涨」与「7日/30日/6月的真实趋势」区分开——避免追一日脉冲。
+    """
+    d1 = w.get("d1") or 0.0
+    d5 = w.get("d5") or 0.0
+    d22 = w.get("d22") or 0.0
+    d120 = w.get("d120") or 0.0
+    if d5 > 0 and d22 > 0 and d120 > 0:
+        return ("强势趋势", "7日/30日/6月全线上行，趋势确立")
+    if d1 > 0 and d22 < -1:
+        return ("超跌反弹·谨慎", "今日反弹但30日仍下行，可能是下跌中继")
+    if d1 < 0 and d5 < 0 and d22 > 1:
+        return ("高位退潮", "30日上行但近一周转跌，警惕见顶")
+    if d22 < -1 and d120 < -1:
+        return ("弱势下行", "30日/6月均下行，趋势偏空")
+    if d22 > 0 and d120 > 0:
+        return ("温和上行", "中期上行、短期反复")
+    return ("震荡", "无明确方向")
+
+
+def fetch_all_boards():
+    """返回全部行业板块 [{code,name,today}]（按今日涨幅降序）。失败返回 []。"""
+    url = (
+        "https://push2.eastmoney.com/api/qt/clist/get?"
+        "pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2&fields=f12,f14,f3"
+    )
+    text = _get(url)
+    if not text:
+        return []
+    try:
+        items = json.loads(text).get("data", {}).get("diff") or []
+    except Exception:
+        return []
+    out = [{"code": it.get("f12"), "name": it.get("f14", ""), "today": it.get("f3")}
+           for it in items if it.get("f3") is not None]
+    out.sort(key=lambda x: x["today"], reverse=True)
+    return out
+
+
+def fetch_board_windows(board_code):
+    """拉某板块日K → 多窗口收益（compute_window_returns）。失败返回 None。"""
+    url = (
+        f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=90.{board_code}"
+        f"&klt=101&fqt=1&lmt=140&end=20500101&fields1=f1&fields2=f51,f53"
+    )
+    text = _get(url)
+    if not text:
+        return None
+    try:
+        kl = json.loads(text).get("data", {}).get("klines") or []
+        closes = [float(x.split(",")[1]) for x in kl]
+    except Exception:
+        return None
+    if len(closes) < 6:
+        return None
+    return compute_window_returns(closes)
+
+
+def scan_sectors(top=8, board=None):
+    """组装板块多窗口扫描结果。board 指定则只下钻该板块（名称模糊匹配）。
+
+    返回 [{code,name,today,d5,d22,d120,vol30,trend,note}]。
+    """
+    boards = fetch_all_boards()
+    if not boards:
+        return []
+    if board:
+        boards = [b for b in boards if board in b["name"]] or boards[:0]
+        picked = boards
+    else:
+        picked = boards[:top] + boards[-top:]  # 涨幅榜 + 落后榜
+    rows = []
+    for b in picked:
+        w = fetch_board_windows(b["code"]) or {}
+        trend, note = classify_board_trend(w) if w else ("数据缺失", "")
+        rows.append({
+            "code": b["code"], "name": b["name"], "today": b["today"],
+            "d5": w.get("d5"), "d22": w.get("d22"), "d120": w.get("d120"),
+            "vol30": w.get("vol30"), "trend": trend, "note": note,
+        })
+    return rows
+
+
+def cmd_sector_scan(args):
+    """板块多窗口扫描：今日 + 7日 + 30日 + 6月 + 趋势分类。"""
+    rows = scan_sectors(top=args.top, board=args.board)
+    if not rows:
+        print("获取板块数据失败")
+        return
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+
+    def f(v):
+        return f"{v:>+6.1f}%" if isinstance(v, (int, float)) else "   --  "
+    print(f"\n📊 板块多窗口扫描（{'下钻 ' + args.board if args.board else '热门+落后'}）")
+    print(f"{'板块':<10} {'今日':>7} {'7日':>7} {'30日':>7} {'6月':>7} {'30d波动':>7}  趋势")
+    print("-" * 78)
+    for r in rows:
+        nm = r["name"][:9]
+        print(f"{nm:<10} {f(r['today'])} {f(r['d5'])} {f(r['d22'])} "
+              f"{f(r['d120'])} {f(r['vol30'])}  {r['trend']}")
+    print("\n说明：今日涨≠趋势好。优先「强势趋势」（多窗口同向上行）；"
+          "「超跌反弹·谨慎」是下跌中继，少追。再用 `discover --sector <板块>` 下钻选基。")
+
+
 def cmd_sectors(args):
     """获取行业板块涨跌排行"""
     # 获取全部板块（按涨幅降序）
@@ -696,6 +968,264 @@ def cmd_nav(args):
         oldest_nav = float(nav_list[-1].get("DWJZ", 0))
         period_return = (latest_nav - oldest_nav) / oldest_nav * 100 if oldest_nav else 0
         print(f"\n区间统计: 最新 {latest_nav} → 起始 {oldest_nav}, 区间收益 {period_return:+.2f}%")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 选基发现（R3/R4）：跨板块下钻挑场外候选，多窗口一致性打分
+# ──────────────────────────────────────────────────────────────────────
+_RANK_PERIOD_SC = {"1n": "1nzf", "6n": "6nzf", "3n": "3nzf", "2n": "2nzf", "jn": "jnzf"}
+
+
+def _rank_url(ft, period, top):
+    sc = _RANK_PERIOD_SC.get(period, "6nzf")
+    now = datetime.now()
+    ed = now.strftime("%Y-%m-%d")
+    days = {"1n": 365, "6n": 180, "3n": 365 * 3, "2n": 365 * 2}.get(period)
+    if period == "jn":
+        sd = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+    else:
+        sd = (now - timedelta(days=days or 180)).strftime("%Y-%m-%d")
+    return (
+        f"http://fund.eastmoney.com/data/rankhandler.aspx?"
+        f"op=ph&dt=kf&ft={ft}&rs=&gs=0&sc={sc}&st=desc"
+        f"&sd={sd}&ed={ed}&qdii=&tabSubtype=,,,,,&pi=1&pn={top}&dx=1"
+    )
+
+
+def _fnum(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_fund_rank(ft="gp", period="6n", top=60, otc_only=True):
+    """结构化基金排行：每只带多窗口区间收益（纯解析可被 cmd_rank/discover 复用）。
+
+    datas 字段：[0]code [1]name [3]date [4]nav [6]日 [7]近1周 [8]近1月
+    [9]近3月 [10]近6月 [11]近1年。返回 [{code,name,venue,date,nav,
+    w_1d,w_1w,w_1m,w_3m,w_6m,w_1y}]。失败返回 []。
+    """
+    text = _get(_rank_url(ft, period, top))
+    if not text:
+        return []
+    m = re.search(r'datas:\[(.*?)\]', text, re.DOTALL)
+    if not m:
+        return []
+    out = []
+    for item in re.findall(r'"([^"]+)"', m.group(1)):
+        f = item.split(",")
+        if len(f) < 12:
+            continue
+        code, name = f[0], f[1]
+        venue = fund_venue(code, name)
+        if otc_only and venue == "场内":
+            continue
+        out.append({
+            "code": code, "name": name, "venue": venue,
+            "date": f[3], "nav": _fnum(f[4]),
+            "w_1d": _fnum(f[6]), "w_1w": _fnum(f[7]), "w_1m": _fnum(f[8]),
+            "w_3m": _fnum(f[9]), "w_6m": _fnum(f[10]), "w_1y": _fnum(f[11]),
+        })
+    return out
+
+
+def score_candidate(c):
+    """多窗口一致性评分（纯函数）：偏好中长期持续上行、不追一周脉冲。
+
+    主看近6月/3月/1月同向走强；近一周涨幅过猛（>15%）轻微扣分避免追高。
+    """
+    w6 = c.get("w_6m") or 0.0
+    w3 = c.get("w_3m") or 0.0
+    w1 = c.get("w_1m") or 0.0
+    ww = c.get("w_1w") or 0.0
+    score = 0.5 * w6 + 0.3 * w3 + 0.2 * w1
+    if ww > 15:
+        score -= (ww - 15) * 0.5  # 一周飙太多，扣分防追高
+    # 多窗口全为正的一致性加成
+    if w6 > 0 and w3 > 0 and w1 > 0:
+        score += 5
+    return round(score, 2)
+
+
+def discover_candidates(sectors=None, limit=8, per_sector=2, exclude=None,
+                        top_n=100):
+    """跨板块下钻挑场外候选基金。
+
+    拉「股票型 + 指数型」近6月排行（仅场外）→ 按基金名归类赛道 →
+    多窗口一致性打分 → 每赛道取前 per_sector、跨赛道轮转凑满 limit。
+    sectors 给定时只保留命中（按赛道标签或名称子串）。exclude 跳过已持有/已知。
+    返回 [{code,name,sector,score,w_1d,w_1w,w_1m,w_3m,w_6m,venue}]（无网络则 []）。
+    """
+    exclude = set(exclude or [])
+    pool = {}
+    for ft in ("gp", "zs"):
+        for c in fetch_fund_rank(ft=ft, period="6n", top=top_n, otc_only=True):
+            if c["code"] in exclude or c["code"] in pool:
+                continue
+            pool[c["code"]] = c
+
+    def matches(name, sec):
+        if not sectors:
+            return True
+        for s in sectors:
+            if s and (s in name or s == sec):
+                return True
+        return False
+
+    buckets = {}
+    for c in pool.values():
+        sec = _infer_sector(c["name"])
+        if not matches(c["name"], sec):
+            continue
+        c = dict(c, sector=sec, score=score_candidate(c))
+        buckets.setdefault(sec, []).append(c)
+
+    for sec in buckets:
+        buckets[sec].sort(key=lambda x: x["score"], reverse=True)
+
+    # 跨赛道轮转，保证多样性（不只盯一个赛道）
+    ordered = sorted(buckets.keys(),
+                     key=lambda s: buckets[s][0]["score"], reverse=True)
+    picked, rank_in_sec = [], {s: 0 for s in ordered}
+    while len(picked) < limit:
+        progressed = False
+        for sec in ordered:
+            i = rank_in_sec[sec]
+            if i < min(per_sector, len(buckets[sec])):
+                picked.append(buckets[sec][i])
+                rank_in_sec[sec] += 1
+                progressed = True
+                if len(picked) >= limit:
+                    break
+        if not progressed:
+            break
+    picked.sort(key=lambda x: x["score"], reverse=True)
+    return picked
+
+
+def cmd_discover(args):
+    """跨板块发现新候选基金（默认排除已持有，避免老盯那几只）。"""
+    sectors = [s.strip() for s in args.sector.split(",")] if args.sector else None
+    exclude = set()
+    if DB_AVAILABLE:
+        try:
+            db = Database()
+            row = db.conn.execute(
+                "SELECT id FROM accounts WHERE name=?", (args.account,)).fetchone()
+            if row:
+                for p in db.conn.execute(
+                        "SELECT code FROM positions WHERE account_id=?", (row["id"],)):
+                    exclude.add(p["code"])
+            db.close()
+        except Exception:
+            pass
+    cands = discover_candidates(sectors=sectors, limit=args.top,
+                                per_sector=args.per_sector, exclude=exclude)
+    if getattr(args, "json", False):
+        print(json.dumps(cands, ensure_ascii=False, indent=2))
+        return
+    if not cands:
+        print("未发现候选（可能离线，或筛选过严）")
+        return
+
+    def f(v):
+        return f"{v:>+6.1f}%" if isinstance(v, (int, float)) else "   --  "
+    title = f"赛道 {args.sector}" if sectors else "跨赛道"
+    print(f"\n🔭 选基发现（{title}，已排除持仓）Top {len(cands)}：")
+    print(f"{'代码':<8} {'名称':<22} {'赛道':<5} {'今日':>7} {'1周':>7} "
+          f"{'1月':>7} {'3月':>7} {'6月':>7} {'评分':>6}")
+    print("-" * 96)
+    for c in cands:
+        print(f"{c['code']:<8} {c['name'][:21]:<22} {c['sector']:<5} "
+              f"{f(c['w_1d'])} {f(c['w_1w'])} {f(c['w_1m'])} {f(c['w_3m'])} "
+              f"{f(c['w_6m'])} {c['score']:>6.1f}")
+    print("\n短线买C类、长线买A类：选定后用 `share-class <代码> --prefer C|A` 查对应份额。")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 份额兄弟解析（R5）：A↔C 份额查找，短线买C·长线买A
+# ──────────────────────────────────────────────────────────────────────
+def _fund_search(key):
+    """天天基金搜索接口 → [{code,name}]。失败返回 []。"""
+    import urllib.parse
+    url = ("https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?"
+           f"m=1&key={urllib.parse.quote(key)}")
+    text = _get(url, headers={"Referer": "https://fund.eastmoney.com/"})
+    if not text:
+        return []
+    try:
+        rows = json.loads(text).get("Datas") or []
+    except Exception:
+        return []
+    return [{"code": r.get("CODE"), "name": r.get("NAME")}
+            for r in rows if r.get("CODE") and r.get("NAME")]
+
+
+def pick_siblings(rows, base):
+    """从搜索结果里按基名匹配同一基金的各类份额（纯函数）→ {类别字母: code}。"""
+    sib = {}
+    for r in rows:
+        if base_fund_name(r["name"]) == base:
+            cls = detect_share_class(r["name"]) or "?"
+            sib.setdefault(cls, r["code"])
+    return sib
+
+
+def resolve_share_class(code, prefer=None, name=None):
+    """基金代码 → 当前份额类别 + A/C 兄弟代码 + 推荐买入代码（需联网）。"""
+    if not name:
+        text = _get(f"http://fundgz.1234567.com.cn/js/{code}.js")
+        gz = _parse_jsonp(text) if text else None
+        name = gz.get("name") if gz else None
+    if not name:
+        for r in _fund_search(code):
+            if r["code"] == code:
+                name = r["name"]
+                break
+    if not name:
+        return {"error": f"无法获取 {code} 名称（可能离线）"}
+    cur = detect_share_class(name)
+    base = base_fund_name(name)
+    # 搜索接口对含括注（如「(QDII)」）的长名匹配很差，去掉括注再搜，
+    # 但仍按完整 base 比对兄弟（保留「人民币/美元」区分，避免错配）。
+    search_key = _PAREN_RE.sub("", base).strip()
+    sib = pick_siblings(_fund_search(search_key), base)
+    if prefer and prefer not in sib and search_key != base:
+        sib.update(pick_siblings(_fund_search(base), base))
+    sib.setdefault(cur or "?", code)
+    rec = sib.get(prefer) if prefer else None
+    return {"code": code, "name": name, "current_class": cur, "base": base,
+            "siblings": sib, "prefer": prefer, "recommended": rec}
+
+
+_SHARE_CLASS_NOTE = {
+    "C": "短线优选C类（无申购费、按日计销售服务费，持有约<1~2年更省费）",
+    "A": "长线优选A类（有申购费但无销售服务费，长期持有总成本更低）",
+}
+
+
+def cmd_share_class(args):
+    """查份额类别 + A/C 兄弟代码，给短C长A建议。"""
+    r = resolve_share_class(args.code, prefer=args.prefer)
+    if getattr(args, "json", False):
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return
+    if r.get("error"):
+        print(r["error"])
+        return
+    print(f"\n{r['name']}（{args.code}）当前为 {r['current_class'] or '单一/未知'} 类")
+    if r["siblings"]:
+        print("兄弟份额：")
+        for cls, c in sorted(r["siblings"].items()):
+            print(f"  {cls}类: {c}{'  ← 当前' if c == args.code else ''}")
+    if args.prefer:
+        note = _SHARE_CLASS_NOTE.get(args.prefer, "")
+        if r.get("recommended"):
+            same = "（已是该类，无需换）" if r["recommended"] == args.code else ""
+            print(f"→ 建议买 {args.prefer} 类：{r['recommended']}{same}　{note}")
+        else:
+            print(f"→ 未找到 {args.prefer} 类兄弟份额（可能该基金无此份额）")
 
 
 def cmd_rank(args):
@@ -1467,7 +1997,7 @@ def _fund_snapshot(code, name, sector):
 
         nav_url = (
             f"https://api.fund.eastmoney.com/f10/lsjz?"
-            f"fundCode={code}&pageIndex=1&pageSize=60"   # widened for MACD (needs 35+)
+            f"fundCode={code}&pageIndex=1&pageSize=140"  # 140≈半年交易日，供6月窗口
         )
         nav_text = _get(
             nav_url,
@@ -1504,6 +2034,15 @@ def _fund_snapshot(code, name, sector):
             sig = {"rsi_14": None, "macd_hist": None,
                    "ma20_slope": None, "breakout_20d": None}
 
+        # 30日波动率（日收益标准差，年化前的原始百分比）
+        vol_30d = None
+        if len(navs) >= 22:
+            seg = navs[-22:]
+            rr = [(seg[i] / seg[i - 1] - 1) for i in range(1, len(seg)) if seg[i - 1]]
+            if rr:
+                mean = sum(rr) / len(rr)
+                vol_30d = (sum((r - mean) ** 2 for r in rr) / len(rr)) ** 0.5
+
         return {
             "name": display_name,
             "current_nav": current_nav,
@@ -1511,6 +2050,9 @@ def _fund_snapshot(code, name, sector):
             "fund_3d_return": _ret(3),
             "fund_5d_return": _ret(5),
             "fund_20d_return": _ret(20),
+            "fund_60d_return": _ret(60),    # ≈近3月
+            "fund_120d_return": _ret(120),  # ≈近6月
+            "vol_30d": vol_30d,
             "high_20d": max(navs[-20:]) if len(navs) >= 20 else current_nav,
             "sector": sector or _infer_sector(display_name),
             "signals": sig,
@@ -1519,11 +2061,14 @@ def _fund_snapshot(code, name, sector):
         return None
 
 
-def gather_market_snapshot(account_name="主线", date=None):
+def gather_market_snapshot(account_name="主线", date=None, discover=0):
     """Aggregate inputs DecisionEngine.decide() needs.
 
     Returns dict with hs300 returns + per-fund snapshots for portfolio + watchlist.
     Each missing fund becomes None — engine emits data_missing alert for those.
+
+    discover>0：再注入 N 只「跨板块发现」的新候选（默认 0=关闭，保持离线/测试
+    确定性；decide.py/daily_report 显式开启，让引擎不只盯固定那几只）。
     """
     import sys as _sys
     _sys.path.insert(0, str(SCRIPT_DIR := Path(__file__).resolve().parent))
@@ -1558,6 +2103,9 @@ def gather_market_snapshot(account_name="主线", date=None):
             if code in QDII_INDEX_MAP:
                 funds[code]["ref_index"] = "NDX"
 
+        for code in funds:
+            funds[code].setdefault("source", "held")
+
         # Watchlist: simulate.py's DEFAULT_FUNDS, if importable
         try:
             from simulate import DEFAULT_FUNDS  # type: ignore
@@ -1565,9 +2113,32 @@ def gather_market_snapshot(account_name="主线", date=None):
                 if code not in funds:
                     snap = _fund_snapshot(code, name, None)
                     if snap:
+                        snap["source"] = "watchlist"
                         funds[code] = snap
         except Exception:
             pass
+
+        # R3/R4 动态候选池：跨板块发现新基金，让引擎不只盯固定那几只。
+        # 默认关闭（discover=0）；显式开启时注入，已持有/已知会被排除。
+        discovered = []
+        if discover and discover > 0:
+            try:
+                for c in discover_candidates(
+                        limit=discover, exclude=set(funds.keys())):
+                    snap = _fund_snapshot(c["code"], c["name"], c.get("sector"))
+                    if snap:
+                        snap["source"] = "discovered"
+                        snap["discover_score"] = c.get("score")
+                        # 排行接口已带多窗口，作为净值缺失时的兜底
+                        snap.setdefault("rank_windows", {
+                            k: c.get(k) for k in
+                            ("w_1w", "w_1m", "w_3m", "w_6m")})
+                        funds[c["code"]] = snap
+                        discovered.append({"code": c["code"], "name": c["name"],
+                                           "sector": c.get("sector"),
+                                           "score": c.get("score")})
+            except Exception:
+                pass
 
         # Peak value: use max(total_value) from daily_snapshots if available
         peak = None
@@ -1602,6 +2173,7 @@ def gather_market_snapshot(account_name="主线", date=None):
             "hs300_20d_return": hs300_20d,
             "regime_hint": None,
             "funds": funds,
+            "discovered": discovered,
             "portfolio_peak_value": peak,
             "index_trend": index_trend,
             "news": news,
@@ -1613,7 +2185,8 @@ def gather_market_snapshot(account_name="主线", date=None):
 
 
 def cmd_market_snapshot(args):
-    snap = gather_market_snapshot(account_name=args.account, date=args.date)
+    snap = gather_market_snapshot(account_name=args.account, date=args.date,
+                                  discover=getattr(args, "discover", 0))
     print(json.dumps(snap, ensure_ascii=False, indent=2))
 
 
@@ -1621,11 +2194,35 @@ def main():
     parser = argparse.ArgumentParser(description="基金数据抓取工具 — Smart Invest Skill")
     sub = parser.add_subparsers(dest="command", help="子命令")
 
+    # now — 会话开始对表（本机时间/时区/交易时段）
+    p_now = sub.add_parser("now", help="本机时间/时区/星期 + A股交易时段（会话开始先对表）")
+    p_now.add_argument("--json", action="store_true", help="输出 JSON")
+
     # indices
     sub.add_parser("indices", help="获取大盘指数实时行情")
 
     # sectors
     sub.add_parser("sectors", help="获取行业板块涨跌排行")
+
+    # sector-scan — 板块多窗口扫描（7日/30日/6月 + 趋势分类）
+    p_ss = sub.add_parser("sector-scan", help="板块多窗口扫描：今日/7日/30日/6月波动+趋势分类")
+    p_ss.add_argument("--top", type=int, default=8, help="涨幅榜/落后榜各取 N（默认8）")
+    p_ss.add_argument("--board", "-b", help="只下钻某板块（名称模糊匹配）")
+    p_ss.add_argument("--json", action="store_true", help="输出 JSON")
+
+    # discover — 跨板块发现新候选基金
+    p_disc = sub.add_parser("discover", help="跨板块发现新候选基金（多窗口一致性打分，排除持仓）")
+    p_disc.add_argument("--sector", "-s", help="限定赛道/关键词（逗号分隔，如 半导体,新能源）")
+    p_disc.add_argument("--account", "-a", default="主线", help="排除该账户已持有（默认主线）")
+    p_disc.add_argument("--top", type=int, default=8, help="候选数量（默认8）")
+    p_disc.add_argument("--per-sector", type=int, default=2, help="每赛道至多取 N（默认2）")
+    p_disc.add_argument("--json", action="store_true", help="输出 JSON")
+
+    # share-class — 份额类别 + A/C 兄弟代码（短C长A）
+    p_sc = sub.add_parser("share-class", help="查份额类别+A/C兄弟代码（短线买C·长线买A）")
+    p_sc.add_argument("code", help="基金代码")
+    p_sc.add_argument("--prefer", choices=["A", "B", "C", "D", "E"], help="想买的份额类别")
+    p_sc.add_argument("--json", action="store_true", help="输出 JSON")
 
     # us-index — 美股指数隔夜行情（QDII 方向判断）
     p_us = sub.add_parser("us-index", help="美股指数隔夜行情（QDII 方向，如纳斯达克100）")
@@ -1705,6 +2302,8 @@ def main():
     )
     p_snap.add_argument("--account", "-a", default="主线", help="账户名称")
     p_snap.add_argument("--date", default=None, help="日期（YYYY-MM-DD）")
+    p_snap.add_argument("--discover", type=int, default=0,
+                        help="额外注入 N 只跨板块发现的新候选（默认0）")
 
     args = parser.parse_args()
     if not args.command:
@@ -1712,6 +2311,10 @@ def main():
         return
 
     cmd_map = {
+        "now": cmd_now,
+        "sector-scan": cmd_sector_scan,
+        "discover": cmd_discover,
+        "share-class": cmd_share_class,
         "indices": cmd_indices,
         "sectors": cmd_sectors,
         "us-index": cmd_us_index,

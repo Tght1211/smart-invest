@@ -65,6 +65,9 @@ def _md(text):
     """行内 Markdown → HTML"""
     import re
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    # 删除线 ~~撤销的操作~~ → 灰色划掉（今日操作计划里"改判作废"的项）
+    text = re.sub(r"~~(.+?)~~",
+                  r'<s style="color:#999;">\1</s>', text)
     text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
     return text
 
@@ -376,17 +379,17 @@ def markdown_to_html(md_text):
             held = cells[6].strip() if len(cells) > 6 else ""   # 持有天数（可选第7列）
             if len(cells) >= 6:
                 today_pnl = cells[2]
-                yest_pnl = cells[3]
+                hold_pnl = cells[3]      # 持有收益（累计浮盈金额）
                 ret = cells[4]
                 val = cells[5]
             elif len(cells) >= 5:
                 today_pnl = cells[2]
-                yest_pnl = ""
+                hold_pnl = ""
                 ret = cells[3]
                 val = cells[4]
             else:
                 today_pnl = ""
-                yest_pnl = ""
+                hold_pnl = ""
                 ret = cells[2] if len(cells) > 2 else ""
                 val = cells[-1] if len(cells) > 1 else ""
             today_s = _color_pct(today)
@@ -409,8 +412,8 @@ def markdown_to_html(md_text):
                 parts.append(
                     f'&nbsp;&nbsp;今日 <span style="color:{pnl_color};font-weight:600;">{_md(today_pnl)}</span>'
                 )
-            if yest_pnl.strip():
-                yp = yest_pnl.strip()
+            if hold_pnl.strip() and hold_pnl.strip() != "--":
+                yp = hold_pnl.strip()
                 if yp.startswith("-"):
                     yc = DN
                 elif yp.startswith("+"):
@@ -418,7 +421,7 @@ def markdown_to_html(md_text):
                 else:
                     yc = GRAY
                 parts.append(
-                    f'&nbsp;&nbsp;昨日 <span style="color:{yc};font-weight:600;">{_md(yp)}</span>'
+                    f'&nbsp;&nbsp;持有收益 <span style="color:{yc};font-weight:600;">{_md(yp)}</span>'
                 )
             parts.append(
                 f'</p></td>'

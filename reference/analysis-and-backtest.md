@@ -35,13 +35,21 @@ python3 scripts/fetch_fund.py nav <code> --days 60
 
 ## 行业方向分析（模式 D）
 
+**铁律：看板块必看多窗口（今日 / 7日 / 30日 / 6月）+ 典型新闻，别追一日脉冲。**
+
 ```bash
-python3 scripts/fetch_fund.py sectors
-python3 scripts/fetch_fund.py rank --type gp --period 6n --top 20
-python3 scripts/fetch_fund.py rank --type zs --period 6n --top 20
+python3 scripts/fetch_fund.py sector-scan --top 8          # 板块 今日/7日/30日/6月波动 + 趋势分类
+python3 scripts/fetch_fund.py sector-scan --board 半导体     # 下钻单个板块的多窗口
+python3 scripts/fetch_fund.py discover --sector 半导体       # 该方向场外候选（多窗口一致性打分，排除持仓）
+python3 scripts/fetch_fund.py rank --type gp --period 6n --top 20 --otc-only   # 备用：场外股票型排行
 ```
 
-WebSearch 行业政策/动态。给出 2-3 个该方向代表基金 + 仓位建议。
+判读规则：
+- **强势趋势**（7日/30日/6月同向上行）= 真趋势，优先；
+- **超跌反弹·谨慎** = 今日反弹但 30 日仍下行，多为下跌中继，少追；
+- **高位退潮 / 弱势下行** = 回避。
+
+工作流：`sector-scan` 选出真强势方向 → `discover --sector <方向>` 下钻挑 2-3 只场外候选 → WebSearch 该方向政策/产业新闻佐证 → 结合 6 个月波动给仓位建议。短线波段标的买 C 类、长线核心买 A 类（`share-class <code> --prefer C|A` 查代码）。
 
 ---
 

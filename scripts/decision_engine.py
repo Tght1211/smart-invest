@@ -15,6 +15,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import Database
 
 
+# ── 短期买C·长期买A（R5）：规则 → 持有期 + 优选份额（纯函数，便于测试）──
+SHORT_TERM_RULES = {"low_buy", "rsi_oversold_buy", "momentum_breakout"}
+LONG_TERM_RULES = {"position_build"}
+SHARE_CLASS_NOTE_ZH = {
+    "C": "短线优选C类（无申购费、按日计销售服务费，持有约<1~2年更省费）",
+    "A": "长线优选A类（有申购费但无销售服务费，长期持有总成本更低）",
+}
+
+
+def horizon_for_rule(rule_id):
+    """规则 → (持有期, 优选份额, 中文理由)。短线低吸/信号买→C；核心建仓→A。
+
+    返回 (None, None, None) 表示该规则不区分份额（如各类卖出）。
+    """
+    base = (rule_id or "").replace("_deferred_drawdown", "")
+    if base in LONG_TERM_RULES:
+        return ("long", "A", "核心仓位、计划长期持有")
+    if base in SHORT_TERM_RULES:
+        return ("short", "C", "波段/低吸、计划短期持有")
+    return (None, None, None)
+
+
 def evaluate_trade_timing(action, nav_at_trade, nav_after, horizon_days=None,
                           threshold=0.02, scale=0.10):
     """评定一笔历史交易的择时是否「正确踩中」（纯函数，无网络、无 DB）。
@@ -153,6 +175,7 @@ class DecisionEngine:
             "actions": actions,
             "blocked_actions": blocked,
             "alerts": alerts,
+            "discovered": market_data.get("discovered", []),
             "summary": self._build_summary(actions),
         }
 
@@ -741,6 +764,28 @@ class DecisionEngine:
 
     # ---------- P6: 总仓位管理（分批建仓 / 超配回撤）----------
 
+    @staticmethod
+    def _candidate_momentum(fund):
+        """多窗口一致性动量（R3/R4）：综合 20/60/120 日，多窗口同向上行加成。
+
+        缺 60/120 日时回退到 discover 注入的 rank_windows（百分比→小数）。
+        只有 20 日时退化为原行为（≈ fund_20d_return），不影响既有用例。
+        """
+        w20 = fund.get("fund_20d_return") or 0.0
+        w60 = fund.get("fund_60d_return")
+        w120 = fund.get("fund_120d_return")
+        rw = fund.get("rank_windows") or {}
+        if w60 is None and rw.get("w_3m") is not None:
+            w60 = rw["w_3m"] / 100.0
+        if w120 is None and rw.get("w_6m") is not None:
+            w120 = rw["w_6m"] / 100.0
+        w60 = w60 or 0.0
+        w120 = w120 or 0.0
+        score = 0.5 * w20 + 0.3 * w60 + 0.2 * w120
+        if w20 > 0 and w60 > 0 and w120 > 0:
+            score += 0.05  # 多窗口全线上行的一致性加成
+        return score
+
     def _try_position_build(self, snapshot, regime, funds, positions,
                             cash, total_value, buy_codes, positions_with_sell):
         """总仓位低于目标下限时，按动量挑候选分批建仓。返回 action 列表。"""
@@ -795,7 +840,7 @@ class DecisionEngine:
             cap = (fc.get(code) or {}).get("max_daily_buy")
             if cap is not None and cap < min_order:
                 continue  # 限购基金不占建仓名额
-            cands.append((fund.get("fund_20d_return") or 0.0, code, fund))
+            cands.append((self._candidate_momentum(fund), code, fund))
         if not cands:
             return []
         cands.sort(key=lambda t: t[0], reverse=True)
@@ -1102,7 +1147,40 @@ class DecisionEngine:
         # P6: 限购裁剪（最后一道，对所有买入生效）
         self._apply_fund_constraints(actions)
 
+        # R5: 给买入建议标注持有期 + 短C长A份额偏好（不改决策，只补细节）
+        self._annotate_horizon(actions)
+
         return actions, blocked, alerts
+
+    def _annotate_horizon(self, actions):
+        """为 buy/watch 建议加 horizon + share_class（短线→C，长线→A）。"""
+        try:
+            from fetch_fund import detect_share_class
+        except Exception:
+            def detect_share_class(_):
+                return None
+        for a in actions:
+            if a.get("action") not in ("buy", "watch"):
+                continue
+            horizon, pref, _why = horizon_for_rule(a.get("rule_id", ""))
+            if not horizon:
+                continue
+            cur = detect_share_class(a.get("name", ""))
+            if cur and cur != pref:
+                tip = (f"当前为{cur}类，建议改买{pref}类兄弟份额"
+                       f"（用 fetch_fund.py share-class {a.get('code', '')} "
+                       f"--prefer {pref} 查代码）。")
+            elif cur == pref:
+                tip = f"已是{pref}类，无需换份额。"
+            else:
+                tip = f"建议选{pref}类份额。"
+            a["horizon"] = horizon
+            a["share_class"] = {
+                "preferred": pref,
+                "current": cur,
+                "reason_zh": SHARE_CLASS_NOTE_ZH[pref] + "。" + tip,
+            }
+        return actions
 
     def _build_summary(self, actions):
         counts = {"buy": 0, "sell": 0, "hold": 0, "watch": 0}

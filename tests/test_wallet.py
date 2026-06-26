@@ -211,20 +211,25 @@ class CardWalletTest(unittest.TestCase):
             positions.append({"code": "540010", "name": "汇丰晋信", "shares": 200,
                               "cost_nav": 6.84, "sector": "A股科技", "is_pending": True})
         return {"funds": funds, "positions": positions, "cash": 30000.0,
-                "account": "主线", "dca_plans": []}
+                "account": "主线", "dca_plans": [], "budget": 36500.0}
 
     def test_basic_content_and_math(self):
         import daily_report, fetch_fund
         with mock.patch.object(fetch_fund, "portfolio_return_series",
                                return_value=[("d1", 0.10), ("d2", 0.231)]):
             md = "\n".join(daily_report.card_wallet(self._ctx()))
-        self.assertIn("总钱包（持仓 + 现金）", md)
+        self.assertIn("总钱包（持仓市值 + 现金）", md)
         self.assertIn("可用现金", md)
         self.assertIn("现金储备线(10%)", md)
         self.assertIn("总收益走势", md)
-        # 持仓 8000, 现金 30000 → 总钱包 38000；总收益 = 8000-6500 = 1500 (+23.08%)
+        self.assertIn("持仓收益", md)
+        self.assertIn("持仓成本", md)
+        self.assertIn("本金", md)
+        # 持仓 8000, 现金 30000 → 总钱包 38000；持仓收益 = 8000-6500 = 1500 (+23.08%)
         self.assertIn("¥38,000", md)
         self.assertIn("1,500.00", md)
+        # 现金 30000 = 本金 36500 − 持仓成本 6500 → 标注公式
+        self.assertIn("= 本金 − 持仓成本", md)
 
     def test_pending_excluded_from_pnl_valued_at_cost(self):
         import daily_report, fetch_fund

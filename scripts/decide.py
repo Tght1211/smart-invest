@@ -129,11 +129,27 @@ def summarize_reviews(results):
     }
 
 
+def _share_class_suffix(a):
+    """R5: 买入指令尾巴 — 短线买C·长线买A 的份额提示。"""
+    sc = a.get("share_class") or {}
+    pref = sc.get("preferred")
+    if not pref:
+        return ""
+    cur = sc.get("current")
+    horizon_zh = {"short": "短线", "long": "长线"}.get(a.get("horizon"), "")
+    if cur and cur != pref:
+        return (f"；{horizon_zh}持有→建议买 {pref} 类兄弟份额"
+                f"（跑 `fetch_fund.py share-class {a['code']} --prefer {pref}` 查代码）")
+    if cur == pref:
+        return f"；{horizon_zh}持有→{pref} 类正合适"
+    return f"；{horizon_zh}持有→优选 {pref} 类份额"
+
+
 def _order_instruction(a):
     """P6: 可直接照抄执行的下单指令。"""
     if a["action"] == "buy":
         return (f"📋 照抄指令：在天天基金/支付宝搜索 {a['code']}，"
-                f"买入 ¥{a['suggested_amount']:.0f}")
+                f"买入 ¥{a['suggested_amount']:.0f}" + _share_class_suffix(a))
     if a["action"] == "sell":
         return (f"📋 照抄指令：在持仓中找到 {a['code']}，"
                 f"卖出 {a['suggested_shares']:.2f} 份"
@@ -239,6 +255,17 @@ def _format_md(packet):
                 f"- ❌ {b['name']} ({b['code']}) — {b['reason_zh']}"
             )
 
+    disc = packet.get("discovered") or []
+    if disc:
+        lines.append("")
+        lines.append("## 🔭 本次纳入考察的新候选（跨板块发现）")
+        for d in disc:
+            sc = f"，评分 {d['score']:.0f}" if d.get("score") is not None else ""
+            lines.append(
+                f"- {d['name']} ({d['code']}) — {d.get('sector', '其他')}{sc}"
+            )
+        lines.append("> 已并入候选池供引擎按多窗口动量择优；不再只盯固定那几只。")
+
     if packet["alerts"]:
         lines.append("")
         lines.append("## 预警")
@@ -271,6 +298,7 @@ def cmd_run(args):
     try:
         snap = fetch_fund.gather_market_snapshot(
             account_name=args.account, date=args.date,
+            discover=getattr(args, "discover", 0),
         )
         if isinstance(snap, dict) and "error" in snap:
             print(
@@ -753,6 +781,10 @@ def main():
     p.add_argument(
         "--format", choices=["json", "md", "brief"], default="json",
         help="输出格式（默认: json；brief 是 3-5 行摘要）",
+    )
+    p.add_argument(
+        "--discover", type=int, default=0, metavar="N",
+        help="额外注入 N 只跨板块发现的新候选基金（默认0=只看持仓+观察池）",
     )
     p.set_defaults(func=cmd_run)
 

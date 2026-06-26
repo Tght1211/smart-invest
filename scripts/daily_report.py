@@ -28,7 +28,7 @@ import send_email  # noqa: E402
 SESSIONS = {
     "open":  {"label": "开盘", "time": "09:30"},
     "mid":   {"label": "盘中", "time": "13:00"},
-    "close": {"label": "盘尾", "time": "14:48"},
+    "close": {"label": "盘尾", "time": "14:30"},
 }
 
 # 让利润奔跑：盈利不机械止盈（趋势品种越涨越卖反而踏空），只在亏损时止损。
@@ -42,18 +42,24 @@ TAKE_PROFIT_RULES = {
 
 # ---------- 数据组装 ----------
 
-def build_context(db, account, date):
-    """复刻 decide.cmd_run 的决策包构建，并保留原始 funds 快照（含 day_return）。"""
-    snap = fetch_fund.gather_market_snapshot(account_name=account, date=date)
+def build_context(db, account, date, discover=0):
+    """复刻 decide.cmd_run 的决策包构建，并保留原始 funds 快照（含 day_return）。
+
+    discover>0：额外注入 N 只跨板块发现的新候选（仅供卡片「新方向」展示，
+    auto_record 不会自动买入 source=discovered 的标的，避免每日轮换追新）。
+    """
+    snap = fetch_fund.gather_market_snapshot(account_name=account, date=date,
+                                             discover=discover)
     if isinstance(snap, dict) and "error" in snap:
         return None, snap["error"]
     row = db.conn.execute(
-        "SELECT id, cash FROM accounts WHERE name = ?", (account,)
+        "SELECT id, cash, budget FROM accounts WHERE name = ?", (account,)
     ).fetchone()
     if not row:
         return None, f"account '{account}' not found"
     account_id = row["id"]
     cash = row["cash"] or 0.0
+    budget = (row["budget"] if "budget" in row.keys() else None) or 0.0
 
     positions = []
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -95,7 +101,8 @@ def build_context(db, account, date):
         "packet": packet, "funds": funds, "positions": positions,
         "account_id": account_id, "total_value": total_value, "cash": cash,
         "news": snap.get("news", []) or [], "account": account,
-        "dca_plans": dca_plans,
+        "dca_plans": dca_plans, "discovered": snap.get("discovered", []) or [],
+        "budget": budget, "date": date,
     }, None
 
 
@@ -160,9 +167,10 @@ def card_top(ctx, session):
         total_cost += p["shares"] * p["cost_nav"]
         total_value += p["shares"] * cur
     cum = total_value - total_cost
-    cum_pct = (cum / total_cost * 100) if total_cost else 0.0
+    cum_pct = (cum / total_cost * 100) if total_cost else 0.0  # 持仓收益率：÷持仓成本
     label = f"今日估算盈亏（{sess['label']} {sess['time']}）"
-    stats = f"总市值 ¥{total_value:,.0f} | 累计 {_fmt_amt(cum)} | {cum_pct:+.2f}%"
+    stats = (f"持仓市值 ¥{total_value:,.0f} | 持仓累计 {_fmt_amt(cum)} "
+             f"| {cum_pct:+.2f}%")
     return [":::card", label, f"{total_today:+,.2f}元", stats, ":::", ""]
 
 
@@ -182,20 +190,30 @@ def card_wallet(ctx):
     pos_value = conf_mv + pend_cost
     total_wallet = cash + pos_value
     total_pnl = conf_mv - conf_cost                        # 已确认持仓浮盈
-    pnl_pct = (total_pnl / conf_cost * 100) if conf_cost else 0.0
+    pnl_pct = (total_pnl / conf_cost * 100) if conf_cost else 0.0  # 持仓收益率：÷持仓成本，现金不计入
+    budget = ctx.get("budget", 0.0) or 0.0
     reserve = total_wallet * 0.10
     reserve_state = "充足" if cash >= reserve else "不足，慎再加仓"
 
     out = [
         ":::card",
-        "总钱包（持仓 + 现金）",
+        "总钱包（持仓市值 + 现金）",
         f"¥{total_wallet:,.0f}",
-        f"持仓 ¥{pos_value:,.0f} | 现金 ¥{cash:,.0f} | "
-        f"总收益 {_fmt_amt(total_pnl)} ({pnl_pct:+.2f}%)",
+        f"持仓市值 ¥{pos_value:,.0f} | 可用现金 ¥{cash:,.0f} | "
+        f"持仓收益 {_fmt_amt(total_pnl)} ({pnl_pct:+.2f}%)",
         ":::",
         "",
-        "### 现金 & 额度",
-        f"- 可用现金：¥{cash:,.0f}",
+        "### 本金 & 现金",
+    ]
+    if budget:
+        out.append(f"- 本金（累计投入）：¥{budget:,.0f}")
+    # 现金 = 本金 − 持仓成本 仅在无已实现盈亏时成立；对得上才标注公式，避免卖出后误导。
+    reconciles = budget and abs(cash - (budget - conf_cost)) < 1.0
+    cash_note = "（= 本金 − 持仓成本）" if reconciles else ""
+    out += [
+        f"- 持仓成本 ¥{conf_cost:,.0f}　持仓市值 ¥{conf_mv:,.0f}　"
+        f"持仓收益 {_fmt_amt(total_pnl)}（{pnl_pct:+.2f}%，现金不计入）",
+        f"- 可用现金：¥{cash:,.0f}{cash_note}",
         f"- 现金储备线(10%)：¥{reserve:,.0f}（{reserve_state}）",
     ]
     plans = ctx.get("dca_plans") or []
@@ -276,6 +294,142 @@ def card_action(ctx, session, recorded, skipped=None):
     return [":::action", " ".join(parts), ":::", ""]
 
 
+# ---------- 今日操作计划（三时段预告 / 划改对比，R: 提前确认 + 旁注说明）----------
+
+def _plan_ops_from_packet(ctx):
+    """从决策包抽出今日可执行操作（买/卖），带份额类别与说明。
+
+    排除：止盈（让利润奔跑）、跨板块发现的新候选（在「值得关注」卡，不自动执行）。
+    """
+    packet = ctx.get("packet", {})
+    funds = ctx.get("funds", {})
+    ops = []
+    for a in packet.get("actions", []):
+        if a.get("action") not in ("buy", "sell"):
+            continue
+        if LET_WINNERS_RUN and a.get("rule_id") in TAKE_PROFIT_RULES:
+            continue
+        if (funds.get(a.get("code")) or {}).get("source") == "discovered":
+            continue
+        sc = a.get("share_class") or {}
+        ops.append({
+            "action": a["action"], "code": a["code"], "name": a.get("name", ""),
+            "amount": a.get("suggested_amount"), "shares": a.get("suggested_shares"),
+            "rule_id": a.get("rule_id"), "rule_label": a.get("rule_label", ""),
+            "reason": a.get("reason_zh", ""),
+            "pref_class": sc.get("preferred"), "cur_class": sc.get("current"),
+        })
+    return ops
+
+
+def _op_line(op):
+    """把一条操作渲染成「买入「X」¥金额（规则）［短/长线→份额］」。"""
+    if op["action"] == "buy":
+        head = f"买入「{_short_name(op['name'])}」¥{(op.get('amount') or 0):,.0f}"
+    else:
+        head = (f"卖出「{_short_name(op['name'])}」约 "
+                f"{(op.get('shares') or 0):,.0f} 份")
+    tail = f"（{op['rule_label']}）" if op.get("rule_label") else ""
+    sc = ""
+    pref = op.get("pref_class")
+    if pref:
+        term = "短线" if pref == "C" else "长线"
+        if op.get("cur_class") and op["cur_class"] != pref:
+            sc = f"［{term}→改买{pref}类兄弟份额］"
+        else:
+            sc = f"［{term}→{pref}类］"
+    return f"{head}{tail}{sc}"
+
+
+def _explain_dropped(op, ctx):
+    """解释开盘计划里某操作为何在盘中/盘尾被撤销（旁注说明）。"""
+    code = op["code"]
+    for b in ctx.get("packet", {}).get("blocked_actions", []):
+        if b.get("code") == code:
+            return b.get("reason_zh", "被风控拦截")
+    f = (ctx.get("funds") or {}).get(code) or {}
+    dr = f.get("day_return")
+    if op["action"] == "buy" and dr is not None:
+        return (f"{_short_name(op['name'])} 当前 {dr*100:+.1f}%，"
+                f"低吸/买入条件不再满足")
+    return "市场变化，引擎不再建议"
+
+
+def card_plan(ctx, session, db, persist=False):
+    """今日操作计划：开盘预告 → 盘中/盘尾对比开盘，撤销项划掉+说明、新增项标注、盘尾确认。
+
+    persist=True 才落库（仅定时真跑时）；web 面板/预览只读渲染，绝不覆盖开盘基线。
+    """
+    account_id = ctx["account_id"]
+    date = ctx.get("date") or datetime.now().strftime("%Y-%m-%d")
+    cur = _plan_ops_from_packet(ctx)
+    cur_keys = {(o["action"], o["code"]) for o in cur}
+
+    def _save(sess):
+        if not persist:
+            return
+        try:
+            db.save_daily_plan(account_id, date, sess, cur)
+        except Exception:
+            pass
+
+    if session == "open":
+        out = ["### 📋 今日操作计划（开盘预告）", ""]
+        if cur:
+            for o in cur:
+                out.append(f"- 拟{_op_line(o)} — {o.get('reason', '')}")
+        else:
+            out.append("- 今日暂无操作计划，持有观察（盘中/盘尾有变化再更新）。")
+        _save("open")
+        out.append("")
+        return out
+
+    # 盘中 / 盘尾：对比开盘计划
+    try:
+        prev = db.get_daily_plan(account_id, date, "open") or []
+    except Exception:
+        prev = []
+    prev_keys = {(o["action"], o["code"]) for o in prev}
+    label = "盘中更新" if session == "mid" else "盘尾最终确认"
+    out = [f"### 📋 今日操作计划（{label}）", ""]
+
+    # 没有开盘基线（如只跑了盘尾）→ 当成新计划直接列，不逐条标「新增」
+    if not prev:
+        if cur:
+            for o in cur:
+                out.append(f"- 拟{_op_line(o)} — {o.get('reason', '')}")
+        else:
+            out.append("- 全天无操作信号，持有观察。")
+        if session == "close":
+            out.append("**✅ 今日最终就这么操作"
+                       + ("（已按上方执行并记账）。**" if cur else "：不操作，全部持有。**"))
+        _save(session)
+        out.append("")
+        return out
+
+    changed = False
+    for o in prev:
+        if (o["action"], o["code"]) in cur_keys:
+            out.append(f"- ✅ 维持：{_op_line(o)}")
+        else:
+            changed = True
+            out.append(f"- ~~{_op_line(o)}~~ ❌ 撤销：{_explain_dropped(o, ctx)}")
+    for o in cur:
+        if (o["action"], o["code"]) not in prev_keys:
+            changed = True
+            out.append(f"- 🆕 新增：{_op_line(o)} — {o.get('reason', '')}")
+
+    if not changed:
+        out.append("（较开盘计划无变化）")
+
+    if session == "close":
+        out.append("**✅ 今日最终就这么操作"
+                   + ("（已按上方执行并记账）。**" if cur else "：不操作，全部持有。**"))
+    _save(session)
+    out.append("")
+    return out
+
+
 def card_position(ctx):
     """P6: 总仓位概览 —— 每封日报都让用户看到仓位 vs 目标区间。"""
     adv = ctx["packet"].get("portfolio_advice")
@@ -296,30 +450,35 @@ def card_position(ctx):
 
 
 def card_holdings(ctx):
+    """每只持仓：今日% / 今日预估收益(元) / 持有收益(元) / 累计% / 市值 / 天数。
+
+    列语义对齐 send_email 持仓卡渲染器（cells[3]=持有收益金额）。
+    持有收益 = (现价 − 成本) × 份额；待确认基金当日不计收益。
+    """
     funds, positions = ctx["funds"], ctx["positions"]
     by_pos = {p["code"]: p for p in ctx["packet"]["portfolio_snapshot"]["by_position"]}
     out = ["### 我的持仓（实时估值）", "",
-           "| 基金 | 今日 | 今日盈亏 | 昨日盈亏 | 累计 | 持有 | 天数 |",
+           "| 基金 | 今日 | 今日盈亏 | 持有收益 | 累计 | 市值 | 天数 |",
            "|------|------|---------|---------|------|------|------|"]
     for p in positions:
         f = funds.get(p["code"]) or {}
         cur = f.get("current_nav", p["cost_nav"])
+        value = p["shares"] * cur
         if p.get("is_pending"):
-            value = p["shares"] * cur
             out.append(
                 f"| {_short_name(p['name'])} | -- | 待确认 | -- | "
-                f"-- | {value:,.0f} |"
+                f"-- | {value:,.0f} | -- |"
             )
             continue
         dr = (f.get("day_return", 0.0) or 0.0)
         today_pnl = _today_pnl(p["shares"], cur, dr)
-        value = p["shares"] * cur
+        hold_pnl = (cur - p["cost_nav"]) * p["shares"]   # 持有收益（累计浮盈金额）
         cum_pct = by_pos.get(p["code"], {}).get("profit_pct", 0.0) * 100
         tp = _fmt_amt(today_pnl) if dr else "--"
         hd = p.get("hold_days") or 0
         hd_s = f"{hd}天" if hd else "--"
         out.append(
-            f"| {_short_name(p['name'])} | {dr*100:+.2f}% | {tp} | -- | "
+            f"| {_short_name(p['name'])} | {dr*100:+.2f}% | {tp} | {_fmt_amt(hold_pnl)} | "
             f"{cum_pct:+.2f}% | {value:,.0f} | {hd_s} |"
         )
     out.append("")
@@ -366,6 +525,20 @@ def card_news(ctx, limit=3):
         ts = (it.get("time") or "")[-5:]
         title = it.get("title", "").strip()
         out.append(f"- {('['+ts+'] ') if ts else ''}{title}")
+    out.append("")
+    return out
+
+
+def card_discover(ctx):
+    """新方向候选（跨板块发现）。只展示供人工结合短C长A判断，不自动买入。"""
+    disc = (ctx.get("discovered") if isinstance(ctx, dict) else None) or []
+    if not disc:
+        return []
+    out = ["### 🔭 值得关注的新方向（跨板块发现，未持有）", ""]
+    for d in disc[:5]:
+        sc = f" · 评分{d['score']:.0f}" if d.get("score") is not None else ""
+        out.append(f"- {d['name']}（{d['code']}）— {d.get('sector', '其他')}{sc}")
+    out.append("> 跳出固定持仓看更多赛道；选定后短线买C类、长线买A类。")
     out.append("")
     return out
 
@@ -459,6 +632,10 @@ def auto_record(db, ctx, account, do_email=True):
         if a["action"] == "buy":
             if code in fetch_fund.QDII_INDEX_MAP:
                 skipped.append(f"{_short_name(name)} 加仓（QDII 限购/定投，自动跳过）")
+                continue
+            if f.get("source") == "discovered":
+                # 新发现的跨板块候选：只展示、不自动买，留给人工结合短C长A判断
+                skipped.append(f"{_short_name(name)} 新方向候选（待人工确认，自动路不追新）")
                 continue
             amt = a.get("suggested_amount") or 0.0
             if amt <= 0 or nav <= 0:
@@ -570,12 +747,13 @@ def record_daily_snapshot(db, ctx, date):
     )
     adjusted_total_value = total_value - pending_value
     positions_value = adjusted_total_value - cash
-    # 计算收益率：只算已确认的持仓
+    # 计算收益率：只算已确认持仓的「持仓收益率」= 持仓浮盈 ÷ 持仓成本。
+    # 现金完全不参与（曾用 adjusted_total_value 含现金做分子，导致现金被当成收益，收益率虚高）。
     confirmed_positions = [p for p in ctx.get("positions", []) if not p.get("is_pending")]
     cost_total = sum(
         p["shares"] * p["cost_nav"] for p in confirmed_positions
     )
-    return_pct = ((adjusted_total_value - cost_total) / cost_total * 100) if cost_total > 0 else 0.0
+    return_pct = ((positions_value - cost_total) / cost_total * 100) if cost_total > 0 else 0.0
     # 回撤：对比历史最高
     row = db.conn.execute(
         "SELECT MAX(total_value) AS peak FROM daily_snapshots WHERE account_id = ?",
@@ -601,16 +779,18 @@ def record_daily_snapshot(db, ctx, date):
 
 # ---------- 主流程 ----------
 
-def assemble(db, ctx, session, recorded, skipped=None):
+def assemble(db, ctx, session, recorded, skipped=None, persist=False):
     md = []
     md += card_top(ctx, session)
     md += card_wallet(ctx)              # 总钱包：持仓+现金/额度/总收益走势
     md += card_spark(ctx)               # 纳指隔夜（QDII 当日方向）
     md += card_action(ctx, session, recorded, skipped)
+    md += card_plan(ctx, session, db, persist=persist)  # 今日操作计划：预告→划改→确认
     md += card_position(ctx)
     md += card_holdings(ctx)
     md += card_holding_sparks(ctx)      # 每只持仓近30天净值走势
     md += card_blocks()
+    md += card_discover(ctx)            # 跨板块发现的新方向候选（不自动买）
     md += card_news(ctx)                # 财经要闻（免费 7x24 快讯）
     md += card_timeline(db, ctx)        # 近期操作 + 事后复盘点评
     return "\n".join(md)
@@ -624,11 +804,27 @@ def main():
     ap.add_argument("--no-email", action="store_true", help="只生成不发邮件")
     ap.add_argument("--no-record", action="store_true", help="盘尾不自动记账")
     ap.add_argument("--print", action="store_true", help="把卡片 markdown 打到 stdout")
+    ap.add_argument("--discover", type=int, default=-1, metavar="N",
+                    help="注入 N 只跨板块发现的新候选（默认 -1=盘尾自动6只、其它时段0）")
     ap.add_argument("--html", metavar="PATH", nargs="?", const="__auto__",
                     help="渲染邮件 HTML 到文件供浏览器预览（不发信）；省略路径则写 reports/preview-<session>-<date>.html")
+    ap.add_argument("--no-update", action="store_true",
+                    help="跳过每日自更新检查")
     args = ap.parse_args()
 
     date = args.date or datetime.now().strftime("%Y-%m-%d")
+
+    # 每天首次运行：版本文件比对 → 有更新就 git pull 拉最新 skill（幂等，每天一次）。
+    # 预览(--html) 不触发；失败绝不阻塞日报。
+    if not args.html and not args.no_update:
+        try:
+            import update_check
+            res = update_check.check(apply=True)
+            if res.get("checked"):
+                print(f"[UPDATE] {res['message']}")
+        except Exception as e:
+            print(f"[WARN] 更新检查失败: {e}", file=sys.stderr)
+
     db = Database()
     try:
         # 自动净值校准：昨日按估值记的单笔新买入，待真实收盘净值公布后修正成本/份额。
@@ -641,7 +837,11 @@ def main():
                     f"{_short_name(c['name'])} {c['old_nav']:.4f}→{c['new_nav']:.4f}"
                     for c in applied))
 
-        ctx, err = build_context(db, args.account, date)
+        # 盘尾默认顺带发现 6 只跨板块新候选（仅展示、不自动买）；其它时段不发现以提速。
+        n_disc = args.discover
+        if n_disc < 0:
+            n_disc = 6 if args.session == "close" else 0
+        ctx, err = build_context(db, args.account, date, discover=n_disc)
         if err:
             print(f"[ERROR] {err}", file=sys.stderr)
             return 2
@@ -656,7 +856,9 @@ def main():
             recorded, skipped = auto_record(db, ctx, args.account, do_email=not args.no_email)
             recorded = dca_done + recorded
 
-        md = assemble(db, ctx, args.session, recorded, skipped)
+        # 真跑（非 --html 预览）才把今日操作计划落库，作为后续时段的对比基线
+        md = assemble(db, ctx, args.session, recorded, skipped,
+                      persist=not args.html)
 
         # 记录每日快照（每次运行都写，盘尾最完整）
         record_daily_snapshot(db, ctx, date)

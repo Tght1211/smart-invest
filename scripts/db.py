@@ -646,6 +646,60 @@ class Database:
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
+    # ── 今日操作计划（三时段预告 / 划改对比）──
+    def _ensure_plan_table(self, cursor=None):
+        """建 daily_plans 表（幂等）。老库无需重跑 init 也能自愈。"""
+        c = cursor or self.conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_plans (
+                id INTEGER PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                session TEXT NOT NULL,
+                plan_json TEXT,
+                created_at TEXT,
+                UNIQUE(account_id, date, session)
+            )
+        """)
+        if cursor is None:
+            self.conn.commit()
+
+    def save_daily_plan(self, account_id, date, session, plan):
+        """存某账户某日某时段的操作计划（list[dict] → JSON，按 账户+日期+时段 upsert）。"""
+        self._ensure_plan_table()
+        now = datetime.now().isoformat()
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO daily_plans (account_id, date, session, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, date, session) DO UPDATE SET
+                plan_json = excluded.plan_json, created_at = excluded.created_at
+        """, (account_id, date, session, json.dumps(plan, ensure_ascii=False), now))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_daily_plan(self, account_id, date, session=None):
+        """取某账户某日计划。session 给定取该时段；否则取当日最早时段（开盘优先）。"""
+        self._ensure_plan_table()
+        cur = self.conn.cursor()
+        if session:
+            row = cur.execute(
+                "SELECT plan_json FROM daily_plans "
+                "WHERE account_id=? AND date=? AND session=?",
+                (account_id, date, session)).fetchone()
+        else:
+            order = ("CASE session WHEN 'open' THEN 0 WHEN 'mid' THEN 1 "
+                     "ELSE 2 END")
+            row = cur.execute(
+                "SELECT plan_json FROM daily_plans WHERE account_id=? AND date=? "
+                f"ORDER BY {order} LIMIT 1", (account_id, date)).fetchone()
+        if not row or not row["plan_json"]:
+            return None
+        try:
+            return json.loads(row["plan_json"])
+        except Exception:
+            return None
+
     def get_review_summary(self, account_id, lookback_days=None):
         """聚合复盘：买/卖择时胜率、各结论计数、均分、近期教训。"""
         rows = self.get_trade_reviews(account_id)

@@ -9,6 +9,7 @@ data/simulations/
 data/outbox/
 data/web_panel.pid
 data/web_panel.log
+data/.update_check
 
 # Python
 __pycache__/
