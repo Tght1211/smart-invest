@@ -1143,7 +1143,8 @@ def main():
     sub.add_parser("accounts", help="列出所有账户")
 
     p_paper = sub.add_parser("paper-wallet", help="虚拟钱包（真实当日行情实战测试，区别于梦境回测）")
-    paper_sub = p_paper.add_subparsers(dest="paper_command", required=True)
+    paper_sub = p_paper.add_subparsers(dest="paper_command")
+    paper_sub.required = True  # 兼容 Python 3.6（不支持 add_subparsers(required=)）
     pp_c = paper_sub.add_parser("create", help="新建虚拟钱包")
     pp_c.add_argument("name", help="钱包名称（如 实战-激进-A）")
     pp_c.add_argument("--budget", type=float, default=100000, help="初始资金（默认10万）")
@@ -1203,7 +1204,8 @@ def main():
 
     # 定投计划
     p_dca = sub.add_parser("dca", help="定投计划管理")
-    dca_sub = p_dca.add_subparsers(dest="dca_command", required=True)
+    dca_sub = p_dca.add_subparsers(dest="dca_command")
+    dca_sub.required = True  # 兼容 Python 3.6
 
     d_list = dca_sub.add_parser("list", help="列出定投计划")
     d_list.add_argument("--account", "-a", required=True)

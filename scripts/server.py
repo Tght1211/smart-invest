@@ -16,9 +16,17 @@ import argparse
 import json
 import os
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:  # Python 3.7+
+    from http.server import ThreadingHTTPServer
+except ImportError:  # Python 3.6（部署服务器可能是旧版）
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -147,6 +155,10 @@ def make_server(host, port, db=None, tokens=None):
     from db import Database
     httpd = ThreadingHTTPServer((host, port), _Handler)
     httpd.db = db or Database()
+    try:
+        httpd.db.init_tables()  # 自举建表（CREATE TABLE IF NOT EXISTS，幂等）
+    except Exception:
+        pass
     httpd.tokens = tokens if tokens is not None else load_tokens()
     httpd.lock = threading.Lock()
     return httpd
