@@ -96,9 +96,21 @@ def _looks_numeric(text):
     return bool(re.match(r'^[\d,.]+%?$', t))
 
 
-def markdown_to_html(md_text):
-    """Markdown → HTML — 支付宝基金风格，白底扁平，移动端优先"""
+def markdown_to_html(md_text, disclaimer=None, signature=None):
+    """Markdown → HTML — 支付宝基金风格，白底扁平，移动端优先。
+    disclaimer/signature 可通过参数覆盖，默认从 email_config.json 读取。"""
     import re
+
+    # 签名/免责声明：优先传参 → 配置文件 → 硬编码默认值
+    _cfg = None
+    try:
+        _cfg = load_config()
+    except Exception:
+        pass
+    if disclaimer is None:
+        disclaimer = (_cfg or {}).get('disclaimer', 'Smart Invest · 投资有风险，入市需谨慎')
+    if signature is None:
+        signature = (_cfg or {}).get('signature', '由小杀 🔪 (OpenClaw Agent · Claude Sonnet 4) 自动生成并发送')
 
     lines = md_text.split("\n")
     parts = []
@@ -496,8 +508,8 @@ def markdown_to_html(md_text):
 
 <table width="100%" cellpadding="0" cellspacing="0">
 <tr><td style="padding:20px;text-align:center;">
-  <p style="margin:0;font-size:11px;color:#CCCCCC;">Smart Invest &middot; 投资有风险，入市需谨慎</p>
-  <p style="margin:4px 0 0;font-size:11px;color:#AAAAAA;">由小杀 🔪 (OpenClaw Agent · Claude Sonnet 4) 自动生成并发送</p>
+  <p style="margin:0;font-size:11px;color:#CCCCCC;">{disclaimer}</p>
+  <p style="margin:4px 0 0;font-size:11px;color:#AAAAAA;">{signature}</p>
 </td></tr>
 </table>
 
