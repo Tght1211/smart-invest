@@ -201,6 +201,12 @@ class Simulator:
         self.fund_names = funds or DEFAULT_FUNDS
         self.fund_navs = {}  # code -> {date: nav}
         self.index_data = {}  # secid -> {date: close}
+        # 历史新闻缓存（按月×赛道），引擎回测合成新闻时优先使用真实新闻
+        try:
+            from news_sentiment import load_news_cache
+            self._news_cache = load_news_cache()
+        except ImportError:
+            self._news_cache = {}
         self.peak_value = budget
         self.sim_id = sim_id or datetime.now().strftime("sim-%Y%m%d-%H%M%S")
         self.sim_dir = SIM_DIR / self.sim_id
@@ -537,6 +543,70 @@ class Simulator:
 
     # ==================== Phase 2: 引擎驱动回测 ====================
 
+    def _synthesize_news_sentiment(self, code, name, funds, date, trading_days, idx_today):
+        """合成新闻情绪（回测用）：用市场数据代理新闻情绪。
+
+        逻辑：新闻情绪本质上反映在价格里——
+        - 板块大涨 +5% 大概率有利好新闻
+        - 板块大跌 -5% 大概率有利空新闻
+        - 大盘强势时整体情绪偏乐观
+
+        优先级：真实历史新闻缓存（data/news_cache.json）→ 价格代理合成 → 中性。
+        缓存命中时用真实新闻，未覆盖的月份/赛道才回退到价格代理。
+        """
+        try:
+            from news_sentiment import classify_news_sentiment, cached_news_sentiment
+        except ImportError:
+            return {"score": 0, "label": "中性"}
+
+        # 0. 优先用真实历史新闻缓存（按月×赛道）
+        sector = _infer_sector_local(name)
+        cached = cached_news_sentiment(date, sector=sector, cache=self._news_cache)
+        if cached is not None:
+            return cached
+
+        # 1. 该基金当日涨跌 → 代理该基金相关新闻
+        fund = funds.get(code, {})
+        day_r = fund.get("day_return", 0.0)
+        d5 = fund.get("fund_5d_return", 0.0)
+
+        # 2. 合成新闻条目（基于价格行为）
+        synthetic_items = []
+
+        # 当日大涨/大跌 → 模拟新闻
+        if day_r > 0.03:
+            synthetic_items.append({"title": f"{name} 大涨 {day_r*100:.1f}%，市场看好", "summary": "资金流入"})
+        elif day_r > 0.01:
+            synthetic_items.append({"title": f"{name} 小幅上涨", "summary": ""})
+        elif day_r < -0.03:
+            synthetic_items.append({"title": f"{name} 大跌 {day_r*100:.1f}%，市场担忧", "summary": "风险事件"})
+        elif day_r < -0.01:
+            synthetic_items.append({"title": f"{name} 小幅回调", "summary": ""})
+
+        # 近5天趋势 → 模拟持续新闻
+        if d5 > 0.05:
+            synthetic_items.append({"title": f"{name} 近5日强势上涨 {d5*100:.1f}%", "summary": "利好催化"})
+        elif d5 < -0.05:
+            synthetic_items.append({"title": f"{name} 近5日持续下跌 {d5*100:.1f}%", "summary": "利空压制"})
+
+        # 3. 大盘情绪加成
+        hs300_data = self.index_data.get("1.000300", {}) or {}
+        hs300_dates = sorted(d for d in hs300_data.keys() if d <= date)
+        if len(hs300_dates) >= 6:
+            hs300_now = hs300_data[hs300_dates[-1]]
+            hs300_5d = hs300_data[hs300_dates[-6]]
+            hs300_5d_ret = (hs300_now - hs300_5d) / hs300_5d if hs300_5d else 0
+            if hs300_5d_ret > 0.02:
+                synthetic_items.append({"title": "大盘强势，市场情绪乐观", "summary": "资金流入"})
+            elif hs300_5d_ret < -0.02:
+                synthetic_items.append({"title": "大盘走弱，市场情绪谨慎", "summary": "风险"})
+
+        if not synthetic_items:
+            return {"score": 0, "label": "中性"}
+
+        # 4. 用 news_sentiment 模块打分（sector 已在函数开头推断）
+        return classify_news_sentiment(synthetic_items, sector=sector)
+
     def _build_market_data_for_engine(self, date, trading_days):
         """构造 DecisionEngine.decide() 期望的 market_data 字典。
 
@@ -659,6 +729,17 @@ class Simulator:
         """Use DecisionEngine.decide() to drive trades for this day."""
         market_data = self._build_market_data_for_engine(date, trading_days)
         positions = self._positions_for_engine(date)
+        # ── 合成新闻情绪注入（回测用）──
+        idx_today = trading_days.index(date) if date in trading_days else -1
+        news_by_fund = {}
+        for code, fund in market_data["funds"].items():
+            news_by_fund[code] = self._synthesize_news_sentiment(
+                code, fund.get("name", ""), market_data["funds"],
+                date, trading_days, idx_today
+            )
+        market_data["news"] = []  # 引擎需要这个键存在
+        market_data["news_sentiment_by_fund"] = news_by_fund
+
         packet = self.engine.decide(
             date=date,
             market_data=market_data,

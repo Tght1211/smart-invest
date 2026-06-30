@@ -999,6 +999,197 @@ def _fnum(s):
         return None
 
 
+# ========== 基金基本面 + 红旗清单（借鉴 jiafei 五层框架，补我们量价盲区）==========
+
+def _pingzhong_var(txt, var):
+    """从 pingzhongdata/{code}.js 抽 `var X = ...;` 的右值原文（含 JSON）。"""
+    m = re.search(r"var %s\s*=\s*(.+?);" % re.escape(var), txt, re.S)
+    return m.group(1) if m else None
+
+
+def _parse_work_years(s):
+    """'10年又343天' → 10.94；'343天' → 0.94；空/异常 → None。纯函数。"""
+    if not s:
+        return None
+    y = re.search(r"(\d+)\s*年", s)
+    d = re.search(r"(\d+)\s*天", s)
+    if not y and not d:
+        return None
+    return round((int(y.group(1)) if y else 0) + (int(d.group(1)) if d else 0) / 365.0, 2)
+
+
+def _pct_str(s):
+    """'35.29%' → 35.29；数值原样；异常 → None。纯函数。"""
+    if isinstance(s, (int, float)):
+        return float(s)
+    if not s:
+        return None
+    m = re.search(r"-?\d+(\.\d+)?", str(s))
+    return float(m.group(0)) if m else None
+
+
+def _fetch_top10_concentration(code):
+    """前十大持仓占净值比合计（最新季报）→ float% 或 None。"""
+    url = (f"https://fundf10.eastmoney.com/FundArchivesDatas.aspx?"
+           f"type=jjcc&code={code}&topline=10&year=&month=&rt=0.1")
+    txt = _get(url, headers={"Referer": f"https://fundf10.eastmoney.com/ccmx_{code}.html"})
+    if not txt:
+        return None
+    pcts = [float(x) for x in re.findall(r"(\d+\.\d+)%", txt)][:10]  # 最新一季 top10
+    return round(sum(pcts), 1) if pcts else None
+
+
+def fetch_fundamentals(code):
+    """基金基本面（规模/持有人/经理/资产配置/能力雷达/费率/前十大集中度）。
+
+    单次拉 fund.eastmoney pingzhongdata（一个 JS 含全部）+ 一次持仓，纯网络读取，
+    失败返回 {}（绝不抛异常）。供红旗检查 / discover 质量闸门 / why-not 复用。
+    """
+    out = {"code": code}
+    try:
+        txt = _get(f"http://fund.eastmoney.com/pingzhongdata/{code}.js",
+                   headers={"Referer": "http://fund.eastmoney.com/"})
+        if not txt:
+            return {}
+        name = _pingzhong_var(txt, "fS_name")
+        if name:
+            out["name"] = name.strip().strip('"')
+
+        scale = _pingzhong_var(txt, "Data_fluctuationScale")
+        if scale:
+            try:
+                series = json.loads(scale).get("series", [])
+                if series:
+                    out["scale"] = series[-1].get("y")            # 最新规模(亿)
+                    out["scale_mom"] = _pct_str(series[-1].get("mom"))  # 环比%
+                    out["scale_series"] = [s.get("y") for s in series]
+            except Exception:
+                pass
+
+        hs = _pingzhong_var(txt, "Data_holderStructure")
+        if hs:
+            try:
+                for s in json.loads(hs).get("series", []):
+                    if "机构" in s.get("name", ""):
+                        data = [x for x in s.get("data", []) if x is not None]
+                        if data:
+                            out["inst_pct"] = data[-1]
+            except Exception:
+                pass
+
+        mgr = _pingzhong_var(txt, "Data_currentFundManager")
+        if mgr:
+            try:
+                mj = json.loads(mgr)
+                if mj:
+                    m0 = mj[0]
+                    out["manager"] = {
+                        "name": m0.get("name"),
+                        "work_years": _parse_work_years(m0.get("workTime")),
+                        "ability": _fnum((m0.get("power") or {}).get("avr")),
+                    }
+            except Exception:
+                pass
+
+        aa = _pingzhong_var(txt, "Data_assetAllocation")
+        if aa:
+            try:
+                amap = {}
+                for s in json.loads(aa).get("series", []):
+                    data = [x for x in s.get("data", []) if x is not None]
+                    if not data:
+                        continue
+                    nm = s.get("name", "")
+                    if "股票" in nm:
+                        amap["stock"] = data[-1]
+                    elif "债券" in nm:
+                        amap["bond"] = data[-1]
+                    elif "现金" in nm:
+                        amap["cash"] = data[-1]
+                if amap:
+                    out["asset"] = amap
+            except Exception:
+                pass
+
+        pe = _pingzhong_var(txt, "Data_performanceEvaluation")
+        if pe:
+            try:
+                pj = json.loads(pe)
+                cats, data = pj.get("categories", []), pj.get("data", [])
+                if cats and data and len(cats) == len(data):
+                    out["abilities"] = dict(zip(cats, data))
+                    out["ability_avr"] = _fnum(pj.get("avr"))
+            except Exception:
+                pass
+
+        rate = _pingzhong_var(txt, "fund_Rate")
+        if rate:
+            out["mgmt_rate"] = _fnum(rate.strip().strip('"'))
+
+        out["top10_concentration"] = _fetch_top10_concentration(code)
+        return out
+    except Exception:
+        return out if len(out) > 1 else {}
+
+
+def evaluate_red_flags(f, equity=True):
+    """基金质量红旗清单（纯函数，借鉴 jiafei 13 红旗的可计算子集）。
+
+    返回 [{level, key, msg}]，level ∈ {'critical'(应否决), 'warn'(提示)}。
+    equity=False 时放宽规模/集中度阈值（债基/货基不适用权益口径）。
+    """
+    flags = []
+    if not f:
+        return flags
+
+    def add(level, key, msg):
+        flags.append({"level": level, "key": key, "msg": msg})
+
+    scale = f.get("scale")
+    if scale is not None:
+        if scale < 2:
+            add("critical", "scale_tiny", f"规模仅 {scale:.2f}亿（<2亿），有清盘风险")
+        elif equity and scale > 500:
+            add("warn", "scale_huge", f"规模 {scale:.0f}亿（>500亿），主动管理船大难掉头")
+
+    mom = f.get("scale_mom")
+    if mom is not None and mom > 50:
+        add("warn", "scale_surge", f"单季规模激增 {mom:.0f}%，新钱涌入或稀释收益")
+
+    ss = [x for x in (f.get("scale_series") or []) if x is not None]
+    if len(ss) >= 3 and ss[-1] < ss[-2] < ss[-3]:
+        add("warn", "scale_shrink", "规模连续两季缩水，资金在撤离")
+
+    inst = f.get("inst_pct")
+    if inst is not None and inst > 90:
+        add("critical", "inst_heavy", f"机构持有 {inst:.0f}%（>90%），集中赎回易踩踏")
+
+    wy = (f.get("manager") or {}).get("work_years")
+    if wy is not None and wy < 3:
+        add("warn", "mgr_green", f"现任经理从业 {wy:.1f}年（<3年），未历完整牛熊")
+
+    ab = f.get("abilities") or {}
+    for dim in ("抗风险", "稳定性"):
+        v = ab.get(dim)
+        if v is not None and v < 60:
+            add("warn", "ability_low", f"{dim}评分仅 {v:.0f}（<60），是短板")
+
+    bond = (f.get("asset") or {}).get("bond")
+    if bond is not None and bond > 120:
+        add("critical", "leverage", f"债券占净比 {bond:.0f}%（>120%），加杠杆放大风险")
+
+    conc = f.get("top10_concentration")
+    if conc is not None and conc > 60:
+        add("warn", "concentration", f"前十大持仓占 {conc:.0f}%（>60%），高度集中押注单一方向")
+
+    return flags
+
+
+def has_critical(flags):
+    """是否含 critical 级红旗（否决用）。纯函数。"""
+    return any(x.get("level") == "critical" for x in (flags or []))
+
+
 def fetch_fund_rank(ft="gp", period="6n", top=60, otc_only=True):
     """结构化基金排行：每只带多窗口区间收益（纯解析可被 cmd_rank/discover 复用）。
 
@@ -1049,13 +1240,17 @@ def score_candidate(c):
 
 
 def discover_candidates(sectors=None, limit=8, per_sector=2, exclude=None,
-                        top_n=100):
+                        top_n=100, quality=False):
     """跨板块下钻挑场外候选基金。
 
     拉「股票型 + 指数型」近6月排行（仅场外）→ 按基金名归类赛道 →
     多窗口一致性打分 → 每赛道取前 per_sector、跨赛道轮转凑满 limit。
     sectors 给定时只保留命中（按赛道标签或名称子串）。exclude 跳过已持有/已知。
     返回 [{code,name,sector,score,w_1d,w_1w,w_1m,w_3m,w_6m,venue}]（无网络则 []）。
+
+    quality=True：对入选标的拉基本面跑红旗检查（借鉴 jiafei），剔除 critical 红旗
+    （规模<2亿/机构>90%/杠杆>120%），其余附 red_flags 字段。每只多一次 pingzhongdata
+    抓取（~500KB），故默认关闭——仅手动 discover/选基质检时开，不拖慢三时段日报快照。
     """
     exclude = set(exclude or [])
     pool = {}
@@ -1101,6 +1296,19 @@ def discover_candidates(sectors=None, limit=8, per_sector=2, exclude=None,
         if not progressed:
             break
     picked.sort(key=lambda x: x["score"], reverse=True)
+
+    if quality:
+        kept = []
+        for c in picked:
+            fund = fetch_fundamentals(c["code"])
+            equity = c.get("sector") not in ("债券", "货币")
+            flags = evaluate_red_flags(fund, equity=equity)
+            if has_critical(flags):
+                continue  # 质量否决：不进发现列表
+            c = dict(c, red_flags=flags,
+                     scale=fund.get("scale"), inst_pct=fund.get("inst_pct"))
+            kept.append(c)
+        picked = kept
     return picked
 
 
@@ -1121,7 +1329,8 @@ def cmd_discover(args):
         except Exception:
             pass
     cands = discover_candidates(sectors=sectors, limit=args.top,
-                                per_sector=args.per_sector, exclude=exclude)
+                                per_sector=args.per_sector, exclude=exclude,
+                                quality=getattr(args, "quality", False))
     if getattr(args, "json", False):
         print(json.dumps(cands, ensure_ascii=False, indent=2))
         return
@@ -1140,7 +1349,51 @@ def cmd_discover(args):
         print(f"{c['code']:<8} {c['name'][:21]:<22} {c['sector']:<5} "
               f"{f(c['w_1d'])} {f(c['w_1w'])} {f(c['w_1m'])} {f(c['w_3m'])} "
               f"{f(c['w_6m'])} {c['score']:>6.1f}")
+        for fl in c.get("red_flags", []):
+            print(f"         ⚠️ {fl['msg']}")
+    if getattr(args, "quality", False):
+        print("（已过质量闸门：剔除清盘/踩踏/杠杆等 critical 红旗标的）")
     print("\n短线买C类、长线买A类：选定后用 `share-class <代码> --prefer C|A` 查对应份额。")
+
+
+def cmd_fundamentals(args):
+    """基金基本面体检 + 红旗清单（借鉴 jiafei 五层质量分析，补量价盲区）。"""
+    f = fetch_fundamentals(args.code)
+    if not f or len(f) <= 1:
+        print(f"未取到 {args.code} 的基本面（可能离线或代码无效）")
+        return
+    equity = True  # 单查默认按权益口径；债基阈值差异在 discover 里按赛道处理
+    flags = evaluate_red_flags(f, equity=equity)
+    if getattr(args, "json", False):
+        print(json.dumps({**f, "red_flags": flags}, ensure_ascii=False, indent=2))
+        return
+    print(f"\n🩺 基本面体检：{f.get('name', args.code)}（{args.code}）")
+    print("-" * 56)
+    if f.get("scale") is not None:
+        mom = f.get("scale_mom")
+        print(f"  规模      {f['scale']:.2f}亿" + (f"（环比 {mom:+.1f}%）" if mom is not None else ""))
+    if f.get("inst_pct") is not None:
+        print(f"  机构持有  {f['inst_pct']:.1f}%")
+    mgr = f.get("manager") or {}
+    if mgr.get("name"):
+        wy = mgr.get("work_years")
+        print(f"  基金经理  {mgr['name']}" + (f"（从业 {wy:.1f}年" if wy else "")
+              + (f"，能力评分 {mgr['ability']:.0f}）" if mgr.get("ability") else "）" if wy else ""))
+    asset = f.get("asset") or {}
+    if asset:
+        print(f"  资产配置  股 {asset.get('stock','-')}% / 债 {asset.get('bond','-')}% / 现金 {asset.get('cash','-')}%")
+    if f.get("top10_concentration") is not None:
+        print(f"  前十大集中度 {f['top10_concentration']:.1f}%")
+    if f.get("mgmt_rate") is not None:
+        print(f"  管理费率  {f['mgmt_rate']}%/年")
+    print()
+    if flags:
+        print("  🚩 红旗：")
+        for fl in flags:
+            mark = "🔴" if fl["level"] == "critical" else "🟡"
+            print(f"    {mark} {fl['msg']}")
+    else:
+        print("  ✅ 未触发质量红旗")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1369,13 +1622,13 @@ def cmd_tech(args):
     print("=" * 74)
 
 
-def cmd_index_kline(args):
-    """获取指数历史K线"""
-    secid = args.secid
-    days = args.days
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+def fetch_index_kline(secid, days=120):
+    """指数日 K 线 → {name, points:[{date,open,close,high,low,volume}, ...]}（升序）。
 
+    纯数据，无打印；失败返回 {"name": secid, "points": []}。Web 面板与 CLI 共用。
+    """
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days * 2 + 10)).strftime("%Y%m%d")
     url = (
         f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
         f"secid={secid}&fields1=f1,f2,f3"
@@ -1384,29 +1637,46 @@ def cmd_index_kline(args):
     )
     text = _get(url)
     if not text:
-        print(f"获取指数 {secid} K线失败")
-        return
-
-    data = json.loads(text)
-    klines = data.get("data", {}).get("klines", [])
+        return {"name": secid, "points": []}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {"name": secid, "points": []}
     name = data.get("data", {}).get("name", secid)
-    if not klines:
-        print(f"指数 {secid} 未获取到K线数据")
+    klines = data.get("data", {}).get("klines", []) or []
+    points = []
+    for line in klines:
+        p = line.split(",")
+        if len(p) >= 5:
+            try:
+                points.append({
+                    "date": p[0], "open": float(p[1]), "close": float(p[2]),
+                    "high": float(p[3]), "low": float(p[4]),
+                    "volume": float(p[5]) if len(p) > 5 and p[5] else 0.0,
+                })
+            except (ValueError, IndexError):
+                continue
+    return {"name": name, "points": points[-days:]}
+
+
+def cmd_index_kline(args):
+    """获取指数历史K线"""
+    res = fetch_index_kline(args.secid, args.days)
+    points = res["points"]
+    if not points:
+        print(f"获取指数 {args.secid} K线失败")
         return
 
-    print(f"\n{name} 近 {days} 天日K线:")
+    print(f"\n{res['name']} 近 {args.days} 天日K线:")
     print(f"{'日期':<12} {'开盘':>10} {'收盘':>10} {'最高':>10} {'最低':>10}")
     print("-" * 55)
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) >= 5:
-            date, open_p, close_p, high, low = parts[0], parts[1], parts[2], parts[3], parts[4]
-            print(f"{date:<12} {open_p:>10} {close_p:>10} {high:>10} {low:>10}")
+    for pt in points:
+        print(f"{pt['date']:<12} {pt['open']:>10.2f} {pt['close']:>10.2f} "
+              f"{pt['high']:>10.2f} {pt['low']:>10.2f}")
 
-    # 区间涨跌
-    if klines:
-        first_close = float(klines[0].split(",")[2])
-        last_close = float(klines[-1].split(",")[2])
+    first_close = points[0]["close"]
+    last_close = points[-1]["close"]
+    if first_close:
         change_pct = (last_close - first_close) / first_close * 100
         print(f"\n区间涨跌: {first_close:.2f} → {last_close:.2f} ({change_pct:+.2f}%)")
 
@@ -2076,7 +2346,7 @@ def gather_market_snapshot(account_name="主线", date=None, discover=0):
 
     db = Database()
     try:
-        hs300_5d, hs300_20d = _hs300_returns()
+        hs300_5d, hs300_20d = None, None  # 并发块里抓（见下）
 
         cur = db.conn.cursor()
         row = cur.execute(
@@ -2091,48 +2361,74 @@ def gather_market_snapshot(account_name="主线", date=None, discover=0):
             (account_id,),
         ).fetchall()
 
+        # ── 并发抓取所有独立 IO：HS300/指数趋势/快讯 + 每只基金快照 ──
+        # 原本串行（每只基金 2 个请求 + 指数失败重试退避）≈ 9s；并发后约等于
+        # 最慢单条链路（~2-3s）。urllib 在 IO 上释放 GIL，线程池有效。
+        from concurrent.futures import ThreadPoolExecutor
+
+        specs = [(p["code"], p["name"], p["sector"], "held") for p in positions]
+        held_codes = {p["code"] for p in positions}
+        try:
+            from simulate import DEFAULT_FUNDS  # type: ignore
+            for code, name in DEFAULT_FUNDS.items():
+                if code not in held_codes:
+                    specs.append((code, name, None, "watchlist"))
+        except Exception:
+            pass
+
         funds = {}
-        for p in positions:
-            snap = _fund_snapshot(p["code"], p["name"], p["sector"])
-            if snap:
-                funds[p["code"]] = snap
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            f_hs = ex.submit(_hs300_returns)
+            f_idx = ex.submit(gather_index_trend)
+            f_news = ex.submit(gather_market_news, 8)
+            fund_futs = {ex.submit(_fund_snapshot, c, n, s): (c, src)
+                         for c, n, s, src in specs}
+            try:
+                hs300_5d, hs300_20d = f_hs.result()
+            except Exception:
+                hs300_5d, hs300_20d = None, None
+            try:
+                index_trend = f_idx.result()
+            except Exception:
+                index_trend = {}
+            try:
+                news = f_news.result() or []
+            except Exception:
+                news = []
+            for fut, (code, src) in fund_futs.items():
+                try:
+                    snap = fut.result()
+                except Exception:
+                    snap = None
+                if snap:
+                    snap.setdefault("source", src)
+                    funds[code] = snap
 
         # P5 趋势状态：QDII 基金标记参考指数（trend_exit 用 NDX 而非 A 股）
-        index_trend = gather_index_trend()
         for code in funds:
             if code in QDII_INDEX_MAP:
                 funds[code]["ref_index"] = "NDX"
 
-        for code in funds:
-            funds[code].setdefault("source", "held")
-
-        # Watchlist: simulate.py's DEFAULT_FUNDS, if importable
-        try:
-            from simulate import DEFAULT_FUNDS  # type: ignore
-            for code, name in DEFAULT_FUNDS.items():
-                if code not in funds:
-                    snap = _fund_snapshot(code, name, None)
-                    if snap:
-                        snap["source"] = "watchlist"
-                        funds[code] = snap
-        except Exception:
-            pass
-
         # R3/R4 动态候选池：跨板块发现新基金，让引擎不只盯固定那几只。
-        # 默认关闭（discover=0）；显式开启时注入，已持有/已知会被排除。
+        # 默认关闭（discover=0）；显式开启时注入，已持有/已知会被排除（候选快照也并发）。
         discovered = []
         if discover and discover > 0:
             try:
-                for c in discover_candidates(
-                        limit=discover, exclude=set(funds.keys())):
-                    snap = _fund_snapshot(c["code"], c["name"], c.get("sector"))
-                    if snap:
+                cands = discover_candidates(limit=discover, exclude=set(funds.keys()))
+                with ThreadPoolExecutor(max_workers=min(8, len(cands) or 1)) as ex:
+                    cfuts = {ex.submit(_fund_snapshot, c["code"], c["name"],
+                                       c.get("sector")): c for c in cands}
+                    for fut, c in cfuts.items():
+                        try:
+                            snap = fut.result()
+                        except Exception:
+                            snap = None
+                        if not snap:
+                            continue
                         snap["source"] = "discovered"
                         snap["discover_score"] = c.get("score")
-                        # 排行接口已带多窗口，作为净值缺失时的兜底
                         snap.setdefault("rank_windows", {
-                            k: c.get(k) for k in
-                            ("w_1w", "w_1m", "w_3m", "w_6m")})
+                            k: c.get(k) for k in ("w_1w", "w_1m", "w_3m", "w_6m")})
                         funds[c["code"]] = snap
                         discovered.append({"code": c["code"], "name": c["name"],
                                            "sector": c.get("sector"),
@@ -2152,11 +2448,7 @@ def gather_market_snapshot(account_name="主线", date=None, discover=0):
         except Exception:
             peak = None
 
-        # 报告层附加：财经快讯 + 操作复盘记忆（不驱动引擎，仅供叙事/宏观判断）
-        try:
-            news = gather_market_news(limit=8)
-        except Exception:
-            news = []
+        # 报告层附加：操作复盘记忆（news 已在上方并发块抓取，不再重复请求）
         try:
             review_summary = db.get_review_summary(account_id, lookback_days=60)
         except Exception:
@@ -2216,7 +2508,14 @@ def main():
     p_disc.add_argument("--account", "-a", default="主线", help="排除该账户已持有（默认主线）")
     p_disc.add_argument("--top", type=int, default=8, help="候选数量（默认8）")
     p_disc.add_argument("--per-sector", type=int, default=2, help="每赛道至多取 N（默认2）")
+    p_disc.add_argument("--quality", action="store_true",
+                        help="对候选拉基本面跑红旗检查，剔除清盘/踩踏/杠杆风险标的（慢，多几次抓取）")
     p_disc.add_argument("--json", action="store_true", help="输出 JSON")
+
+    # fundamentals — 单只基金基本面 + 红旗清单（借鉴 jiafei 五层质量分析）
+    p_fund = sub.add_parser("fundamentals", help="基金基本面体检：规模/持有人/经理/集中度 + 红旗清单")
+    p_fund.add_argument("code", help="基金代码")
+    p_fund.add_argument("--json", action="store_true", help="输出 JSON")
 
     # share-class — 份额类别 + A/C 兄弟代码（短C长A）
     p_sc = sub.add_parser("share-class", help="查份额类别+A/C兄弟代码（短线买C·长线买A）")
@@ -2314,6 +2613,7 @@ def main():
         "now": cmd_now,
         "sector-scan": cmd_sector_scan,
         "discover": cmd_discover,
+        "fundamentals": cmd_fundamentals,
         "share-class": cmd_share_class,
         "indices": cmd_indices,
         "sectors": cmd_sectors,

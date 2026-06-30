@@ -22,7 +22,9 @@ class Database:
 
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_FILE
-        self.conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False：允许同步服务器（ThreadingHTTPServer）跨线程复用连接；
+        # 服务器侧用锁串行化访问，单机 CLI/skill 仍是单线程，无副作用。
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -764,6 +766,38 @@ def cmd_accounts(args):
     db.close()
 
 
+def cmd_paper_wallet(args):
+    """虚拟钱包（type=paper）：用真实当日行情 + 真实决策引擎做实战测试。
+
+    区别于「梦境」(type=dream，历史回放回测) —— paper 钱包跑的是「今天」的真实数据，
+    多开几个钱包可并行验证不同初始资金/策略下的实战表现。沿用多账户架构，
+    所有持仓/交易/决策 CLI 都已支持 --account 切换，无需新表。
+    """
+    db = Database()
+    try:
+        if args.paper_command == "create":
+            existing = db.get_account(name=args.name)
+            if existing:
+                print(f"[SKIP] 账户已存在: {args.name}（ID {existing['id']}, 类型 {existing['type']}）")
+                return
+            db.create_account(args.name, "paper", args.budget,
+                              strategy_version=args.strategy)
+            print(f"     用 `decide.py run --account {args.name}` 跑实战决策（真实当日行情）。")
+        elif args.paper_command == "list":
+            papers = [a for a in db.list_accounts() if a["type"] == "paper"]
+            if not papers:
+                print("暂无虚拟钱包。用 `db.py paper-wallet create <名称> --budget <金额>` 开一个。")
+                return
+            print(f"\n{'ID':<5} {'名称':<22} {'预算':>12} {'现金':>12} {'策略':<8}")
+            print("-" * 64)
+            for a in papers:
+                print(f"{a['id']:<5} {a['name']:<22} ¥{a['budget']:>10,.0f} "
+                      f"¥{a['cash']:>10,.0f} {a['strategy_version']:<8}")
+            print()
+    finally:
+        db.close()
+
+
 def cmd_positions(args):
     """查看持仓"""
     db = Database()
@@ -1108,6 +1142,14 @@ def main():
 
     sub.add_parser("accounts", help="列出所有账户")
 
+    p_paper = sub.add_parser("paper-wallet", help="虚拟钱包（真实当日行情实战测试，区别于梦境回测）")
+    paper_sub = p_paper.add_subparsers(dest="paper_command", required=True)
+    pp_c = paper_sub.add_parser("create", help="新建虚拟钱包")
+    pp_c.add_argument("name", help="钱包名称（如 实战-激进-A）")
+    pp_c.add_argument("--budget", type=float, default=100000, help="初始资金（默认10万）")
+    pp_c.add_argument("--strategy", default="v2.0", help="决策树版本（默认 v2.0）")
+    paper_sub.add_parser("list", help="列出所有虚拟钱包")
+
     p_positions = sub.add_parser("positions", help="查看持仓")
     p_positions.add_argument("--account", "-a", required=True, help="账户名称")
 
@@ -1198,6 +1240,7 @@ def main():
     commands = {
         "init": cmd_init,
         "accounts": cmd_accounts,
+        "paper-wallet": cmd_paper_wallet,
         "positions": cmd_positions,
         "trades": cmd_trades,
         "reviews": cmd_reviews,

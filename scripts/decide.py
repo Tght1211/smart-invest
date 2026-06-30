@@ -495,6 +495,19 @@ def cmd_why_not(args):
         code = args.code
         print(f"# 为什么没建议买 {code}\n")
 
+        # 0. 基本面质量体检（借鉴 jiafei 红旗清单）——量价之外的结构性风险
+        try:
+            fundamentals = fetch_fund.fetch_fundamentals(code)
+            rflags = fetch_fund.evaluate_red_flags(fundamentals)
+            if rflags:
+                crit = fetch_fund.has_critical(rflags)
+                print(f"🩺 质量体检：{'⛔ 命中否决级红旗，本就不该买' if crit else '有质量提示'}")
+                for fl in rflags:
+                    print(f"   {'🔴' if fl['level']=='critical' else '🟡'} {fl['msg']}")
+                print()
+        except Exception:
+            pass
+
         # 1. Was it actively recommended?
         actions = [a for a in packet["actions"] if a["code"] == code]
         if any(a["action"] == "buy" for a in actions):

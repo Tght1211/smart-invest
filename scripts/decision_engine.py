@@ -16,7 +16,7 @@ from db import Database
 
 
 # ── 短期买C·长期买A（R5）：规则 → 持有期 + 优选份额（纯函数，便于测试）──
-SHORT_TERM_RULES = {"low_buy", "rsi_oversold_buy", "momentum_breakout"}
+SHORT_TERM_RULES = {"low_buy", "news_buy", "rsi_oversold_buy", "momentum_breakout"}
 LONG_TERM_RULES = {"position_build"}
 SHARE_CLASS_NOTE_ZH = {
     "C": "短线优选C类（无申购费、按日计销售服务费，持有约<1~2年更省费）",
@@ -200,6 +200,34 @@ class DecisionEngine:
             if rel:
                 a.setdefault("context", {})["news"] = rel
 
+    def _compute_news_sentiment(self, code, fund, market_data):
+        """为某只基金计算新闻情绪 → {score, label, bullish_count, bearish_count}。
+
+        从 market_data['news'] 中按基金名/赛道匹配新闻，用 news_sentiment 打分。
+        无新闻或模块缺失时返回中性。不驱动决策（除动态低吸阈值外），仅供 reason_zh 展示。
+        """
+        # 回测模式：优先用预计算的合成新闻情绪
+        sentiment_by_fund = (market_data or {}).get("news_sentiment_by_fund") or {}
+        if code in sentiment_by_fund:
+            return sentiment_by_fund[code]
+
+        news = (market_data or {}).get("news") or []
+        if not news:
+            return {"score": 0, "label": "中性", "bullish_count": 0, "bearish_count": 0}
+        try:
+            from news_sentiment import classify_news_sentiment
+            from fetch_fund import relevant_news
+        except ImportError:
+            return {"score": 0, "label": "中性", "bullish_count": 0, "bearish_count": 0}
+        name = fund.get("name", "")
+        sector = fund.get("sector") or ""
+        rel = relevant_news(news, name=name, sector=sector, limit=5)
+        if not rel:
+            return {"score": 0, "label": "中性", "bullish_count": 0, "bearish_count": 0}
+        # relevant_news 返回标题字符串列表，转回 dict 格式
+        items = [{"title": t, "summary": ""} for t in rel]
+        return classify_news_sentiment(items, sector=sector)
+
     def _compute_market_regime(self, market_data):
         """Classify market regime by HS300 20-day return.
 
@@ -337,10 +365,37 @@ class DecisionEngine:
 
     # ---------- low_buy rule ----------
 
-    def _try_low_buy(self, code, fund, snapshot, regime, cash, total_value):
-        """Return (action_dict, blocked_dict) — exactly one is None, or both None."""
+    def _try_low_buy(self, code, fund, snapshot, regime, cash, total_value, news_sentiment=None):
+        """Return (action_dict, blocked_dict) — exactly one is None, or both None.
+
+        动态低吸阈值：结合趋势强度 + 新闻情绪，不再写死 -3%。
+        强趋势+利好新闻 → 阈值放宽到 -1.5%（小跌也接）
+        弱趋势+利空新闻 → 阈值收紧到 -5%（更谨慎）
+        """
         day_r = fund.get("day_return", 0.0)
-        if day_r > -0.03:
+
+        # ── 动态低吸阈值（新闻感知 + 趋势强度）──
+        d5 = fund.get("fund_5d_return", 0.0)
+        d20 = fund.get("fund_20d_return", 0.0)
+        d60 = fund.get("fund_60d_return", 0.0)
+        # 趋势强度归一化到 [-1, 1]
+        trend_raw = 0.4 * (d5 * 10) + 0.35 * (d20 * 5) + 0.25 * (d60 * 3)
+        trend_strength = max(-1.0, min(1.0, trend_raw))
+
+        sentiment_score = (news_sentiment or {}).get("score", 0)
+        sentiment_label = (news_sentiment or {}).get("label", "中性")
+
+        try:
+            from news_sentiment import get_dynamic_low_buy_threshold
+            threshold = get_dynamic_low_buy_threshold(
+                trend_strength=trend_strength,
+                news_sentiment=sentiment_score,
+                base_threshold=-0.03
+            )
+        except ImportError:
+            threshold = -0.03
+
+        if day_r > threshold:
             return None, None  # not a low-buy candidate
 
         base_amount = total_value * 0.03
@@ -407,8 +462,10 @@ class DecisionEngine:
             "checks_passed": checks_passed,
             "checks_failed": [],
             "reason_zh": (
-                f"符合低吸规则：当日跌 {abs(day_r) * 100:.1f}%、"
+                f"符合低吸规则：当日跌 {abs(day_r) * 100:.1f}%（动态阈值 {threshold * 100:.1f}%）、"
                 f"近 5 天跌 {abs(fund.get('fund_5d_return', 0.0)) * 100:.1f}%；"
+                f"趋势强度 {trend_strength:.2f}（{d5*100:+.1f}%/5d, {d20*100:+.1f}%/20d, {d60*100:+.1f}%/60d）；"
+                f"新闻情绪 {sentiment_label}（{sentiment_score:+.1f}）；"
                 f"大盘 {regime['label']}；现金 "
                 f"{snapshot['cash_pct'] * 100:.0f}% 在阈值内。"
                 + ("（HS300 处于200日线下方，趋势闸门已将金额打折）"
@@ -1100,8 +1157,13 @@ class DecisionEngine:
                 continue
             if code in dca_codes:
                 continue  # P7: 已委托定投，引擎不出买入建议（卖出已在上方处理）
+            # ── 新闻情绪分析（按基金/赛道匹配）──
+            news_sentiment = self._compute_news_sentiment(
+                code, fund, market_data
+            )
             action, block = self._try_low_buy(
                 code, fund, snapshot, regime, cash, total_value,
+                news_sentiment=news_sentiment,
             )
             if not action and not block:
                 action, block = self._try_signal_buy(

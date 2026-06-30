@@ -324,21 +324,111 @@ class CalibrateCostsTest(unittest.TestCase):
 # ===================== web_panel =====================
 
 class WebPanelTest(unittest.TestCase):
-    def test_nav_bar(self):
-        import web_panel
-        with mock.patch.object(web_panel, "_list_accounts", return_value=["主线", "梦境-1"]):
-            bar = web_panel._nav_bar("主线", "close")
-        self.assertIn("Smart Invest 面板", bar)
-        for w in ("开盘", "盘中", "盘尾", "梦境-1"):
-            self.assertIn(w, bar)
+    """v2 面板：JSON API + 自包含前端。测后端数据层 + 页面外壳。"""
 
-    def test_render_error_fallback(self):
+    def setUp(self):
         import web_panel
-        with mock.patch.object(web_panel, "_build_markdown",
-                               side_effect=RuntimeError("boom")):
-            html = web_panel.render_dashboard("主线", "close")
-        self.assertIn("面板暂时生成失败", html)
-        self.assertIn("http-equiv", html)
+        web_panel._OVERVIEW_CACHE.clear()
+        web_panel._KLINE_CACHE.clear()
+
+    def test_page_html_is_self_contained(self):
+        import web_panel
+        html = web_panel.PAGE_HTML
+        self.assertIn("Smart Invest", html)
+        self.assertIn("/api/overview", html)   # 前端走 JSON API
+        self.assertIn("echarts", html)          # K线/走势图
+
+    def test_overview_error_into_json(self):
+        # build_context 报错 → 进 error 字段，不抛异常、不 500
+        import web_panel
+        with mock.patch.object(web_panel.daily_report, "build_context",
+                               return_value=(None, "boom")), \
+             mock.patch.object(web_panel, "_list_accounts", return_value=["主线"]), \
+             mock.patch.object(web_panel.fetch_fund, "market_clock", return_value={}):
+            data = web_panel._overview_data("主线", "close")
+        self.assertEqual(data["error"], "boom")
+        self.assertEqual(data["account"], "主线")
+
+    def test_overview_shape(self):
+        import web_panel
+        clock = {"time": "14:00", "session": "盘尾"}
+        ctx = {
+            "funds": {"000001": {"name": "测试基金", "current_nav": 1.1,
+                                 "day_return": 0.02, "fund_5d_return": 0.01,
+                                 "fund_20d_return": 0.03, "fund_60d_return": 0.05,
+                                 "sector": "科技", "signals": {"rsi_14": 55}}},
+            "positions": [{"code": "000001", "name": "测试基金", "shares": 1000,
+                           "cost_nav": 1.0, "sector": "科技", "hold_days": 10,
+                           "is_pending": False}],
+            "cash": 5000.0, "budget": 10000.0,
+            "packet": {"actions": [], "alerts": [], "market_regime": {}},
+            "news": [{"title": "利好", "summary": "s", "time": "t", "url": "u"}],
+            "discovered": [], "dca_plans": [],
+        }
+        with mock.patch.object(web_panel.daily_report, "build_context",
+                               return_value=(ctx, None)), \
+             mock.patch.object(web_panel, "_list_accounts", return_value=["主线"]), \
+             mock.patch.object(web_panel.fetch_fund, "market_clock", return_value=clock), \
+             mock.patch.object(web_panel.fetch_fund, "portfolio_return_series",
+                               return_value=[("2026-06-01", 0.1)]):
+            data = web_panel._overview_data("主线", "close")
+        self.assertNotIn("error", data)
+        self.assertEqual(len(data["holdings"]), 1)
+        h = data["holdings"][0]
+        self.assertAlmostEqual(h["market_value"], 1100.0)
+        self.assertAlmostEqual(h["hold_pnl"], 100.0)
+        self.assertAlmostEqual(data["wallet"]["return_pct"], 0.1)   # 100/1000，不含现金
+        self.assertEqual(len(data["news"]), 1)
+
+    def test_kline_fund_vs_index(self):
+        import web_panel
+        with mock.patch.object(web_panel.fetch_fund, "_resolve_chart_target",
+                               return_value=("fund", "000001", None)), \
+             mock.patch.object(web_panel.fetch_fund, "fetch_nav_series",
+                               return_value=[("2026-06-01", 1.0), ("2026-06-02", 1.1)]):
+            d = web_panel._kline_data("000001", 60)
+        self.assertEqual(d["type"], "nav")
+        self.assertEqual(len(d["points"]), 2)
+
+        web_panel._KLINE_CACHE.clear()
+        with mock.patch.object(web_panel.fetch_fund, "_resolve_chart_target",
+                               return_value=("index", "1.000300", "沪深300")), \
+             mock.patch.object(web_panel.fetch_fund, "fetch_index_kline",
+                               return_value={"name": "沪深300",
+                                             "points": [{"date": "2026-06-01", "open": 1,
+                                                         "close": 2, "high": 3, "low": 1,
+                                                         "volume": 10}]}):
+            d = web_panel._kline_data("沪深300", 120)
+        self.assertEqual(d["type"], "ohlc")
+        self.assertEqual(d["name"], "沪深300")
+
+    def test_kline_unknown_target(self):
+        import web_panel
+        with mock.patch.object(web_panel.fetch_fund, "_resolve_chart_target",
+                               return_value=None):
+            d = web_panel._kline_data("???", 60)
+        self.assertIn("error", d)
+
+    def test_fetch_index_kline_parse(self):
+        # 解析东财 klines「日期,开,收,高,低,量」CSV 行 → 结构化 OHLC（升序）
+        import fetch_fund
+        import json as _json
+        blob = _json.dumps({"data": {"name": "沪深300", "klines": [
+            "2026-06-01,4000.0,4050.5,4060,3990,1234",
+            "2026-06-02,4050.5,4020.0,4070,4010,2345",
+        ]}})
+        with mock.patch.object(fetch_fund, "_get", return_value=blob):
+            res = fetch_fund.fetch_index_kline("1.000300", days=120)
+        self.assertEqual(res["name"], "沪深300")
+        self.assertEqual(len(res["points"]), 2)
+        self.assertAlmostEqual(res["points"][0]["close"], 4050.5)
+        self.assertAlmostEqual(res["points"][1]["high"], 4070.0)
+
+    def test_fetch_index_kline_failure(self):
+        import fetch_fund
+        with mock.patch.object(fetch_fund, "_get", return_value=None):
+            res = fetch_fund.fetch_index_kline("1.000300", days=60)
+        self.assertEqual(res["points"], [])
 
 
 if __name__ == "__main__":
