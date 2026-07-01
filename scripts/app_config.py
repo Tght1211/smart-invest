@@ -18,6 +18,13 @@
     "base_url": "https://your-server",
     "token": "...",
     "device_id": "macbook-1"
+  },
+  "web": {                                // 与 smart-invest-web 在线平台双向同步（skill 控制 web / web 回流 skill）
+    "base_url": "http://43.119.62.71:8090",
+    "email": "you@example.com",
+    "password": "...",
+    "wallet": "主线",                      // 本地账户 ↔ web 钱包 的名字映射（缺省同名）
+    "account": "主线"
   }
 }
 """
@@ -52,6 +59,7 @@ def load_config(path=None, force=False):
     cfg.setdefault("mode", "offline")
     cfg.setdefault("llm", {})
     cfg.setdefault("sync", {})
+    cfg.setdefault("web", {})
 
     # 环境变量覆盖（便于 CI / 容器注入，不落盘密钥）
     env = os.environ
@@ -65,6 +73,11 @@ def load_config(path=None, force=False):
         "SMART_INVEST_SYNC_URL": ("sync", "base_url"),
         "SMART_INVEST_SYNC_TOKEN": ("sync", "token"),
         "SMART_INVEST_DEVICE_ID": ("sync", "device_id"),
+        "SMART_INVEST_WEB_URL": ("web", "base_url"),
+        "SMART_INVEST_WEB_EMAIL": ("web", "email"),
+        "SMART_INVEST_WEB_PASSWORD": ("web", "password"),
+        "SMART_INVEST_WEB_WALLET": ("web", "wallet"),
+        "SMART_INVEST_WEB_ACCOUNT": ("web", "account"),
     }.items():
         if env.get(ek):
             cfg[sect][key] = env[ek]
@@ -99,6 +112,10 @@ def sync_config(path=None):
     return load_config(path).get("sync", {}) or {}
 
 
+def web_config(path=None):
+    return load_config(path).get("web", {}) or {}
+
+
 if __name__ == "__main__":
     import sys
     cfg = load_config()
@@ -107,5 +124,7 @@ if __name__ == "__main__":
         safe["llm"]["api_key"] = "***"
     if safe.get("sync", {}).get("token"):
         safe["sync"]["token"] = "***"
+    if safe.get("web", {}).get("password"):
+        safe["web"]["password"] = "***"
     json.dump(safe, sys.stdout, ensure_ascii=False, indent=2)
     print()

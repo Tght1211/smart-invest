@@ -119,7 +119,13 @@ python3 scripts/simulate.py report <sim_id>
 # Email
 python3 scripts/send_email.py check       # CONFIGURED / DISABLED / NOT_CONFIGURED
 python3 scripts/send_email.py test
+
+# 在线同步（两条路径，皆 stdlib、离线/网络失败优雅降级、不动本地数据）
+python3 scripts/sync_client.py ...         # 对接 skill 自己的同步服务器 server.py（:8800，token 鉴权，命名空间隔离）
+python3 scripts/web_sync.py sync --account 主线   # ★ 对接 smart-invest-web 平台（:8090）：skill↔web 双向
 ```
+
+**skill ↔ smart-invest-web 双向同步（`scripts/web_sync.py`）**: smart-invest-web 是那个多用户在线平台（另一个 git 仓库，同级目录，端口 8090）。`web_sync.sync_account()` 用 `app_config.web_config()`（`data/app_config.json` 的 `web` 段：`base_url/email/password/account/wallet`，或 `SMART_INVEST_WEB_*` 环境变量）→ `login()` 换 session token → 把本地账户序列化成 web 的 `{wallet,holdings,trades,cash}` 形态 POST `/api/sync`（**skill 控制 web**）→ web 合并后回传该钱包权威状态（含浏览器/AI 在 web 上产生的新交易）→ `from_web_state` 转回 skill 形态、复用 `sync_client.apply_account` 写回本地（**web 数据回流 skill**）。复用 `sync_client.serialize_account/apply_account`。约定：**被映射的钱包以 skill 账户为持仓/现金权威**（适合 主线 实盘），web 侧新增交易作为历史并回本地；AI 驱动的竞赛钱包不要映射到 skill 账户。测试 `tests/test_web_sync.py`（8，transport 全 mock）。
 
 **Test suite**: `tests/test_decision_engine.py` (engine rules) + `tests/test_decide_cli.py` (CLI smoke) + `tests/test_review.py` (timing verdicts/reviews) + **`tests/test_wallet.py`** (22 tests: `relevant_news`, `portfolio_return_series`, email retry/outbox, operation-report `trade-notify`, `card_wallet`, `calibrate_costs`, web_panel — all mocked) + **`tests/test_upgrade.py`** (21 tests: `market_clock` sessions, `detect_share_class`/`base_fund_name`/`pick_siblings`, `compute_window_returns`/`classify_board_trend`, `discover_candidates`/`score_candidate`, `horizon_for_rule`/`_annotate_horizon`, `_candidate_momentum` — all network mocked) + **`tests/test_update_check.py`** (8 tests: version compare / due-today idempotency / apply-pulls-when-clean / refuse-when-dirty — git+network mocked) + `tests/test_daily_report.py` (incl. `daily_plans` roundtrip + `card_plan` open→close diff with strikethrough) + **`tests/test_news_sentiment.py`** (14: 关键词打分/动态阈值限幅/历史新闻缓存 load+lookup+赛道混合) + **`tests/test_fundamentals.py`** (11) + **`tests/test_llm_client.py`** (12: app_config 加载/env覆盖/Anthropic 兼容 chat/bearer/降级) + **`tests/test_paper_wallet.py`** (3: 虚拟钱包多账户隔离) + others. 289 tests total, all stdlib `unittest`. No linter or build step.
 
